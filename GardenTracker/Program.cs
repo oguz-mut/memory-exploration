@@ -19,6 +19,7 @@ Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
 // Shared state
 var _lock = new object();
 var plants = new Dictionary<long, PlantInfo>();
+var _pendingPlants = new Dictionary<long, PlantInfo>(); // plants we've seen but not confirmed as ours
 var seeds = new List<SeedInfo>();
 var stats = new GardenStats();
 int gardeningLevel = 0;
@@ -160,7 +161,9 @@ void ProcessLogLine(string line)
 
                 if (plants.ContainsKey(entityId))
                 {
+                    // Already tracking this plant — update it
                     var existingPlant = plants[entityId];
+                    string prevState = existingPlant.CurrentState;
                     existingPlant.CurrentState = state;
                     existingPlant.Action = action;
                     existingPlant.Scale = scale;
@@ -168,16 +171,52 @@ void ProcessLogLine(string line)
                 }
                 else
                 {
-                    plants[entityId] = new PlantInfo
+                    // Only start tracking a plant if we can tell it's ours.
+                    // Strategy: remember "pending" plants when we see Thirsty/Hungry.
+                    // If the same entity transitions to Growing within ~3 seconds,
+                    // that means WE watered/fertilized it (our action caused the transition).
+                    // Also claim plants we see at Scale=0.5 with Thirsty (freshly planted by us).
+                    if (state == "Thirsty" || state == "Hungry")
                     {
-                        EntityId = entityId,
-                        PlantName = plantName,
-                        CurrentState = state,
-                        Action = action,
-                        Scale = scale,
-                        LastUpdateTime = DateTime.Now,
-                        FirstSeenTime = DateTime.Now
-                    };
+                        // Store as pending — not yet confirmed as ours
+                        _pendingPlants[entityId] = new PlantInfo
+                        {
+                            EntityId = entityId,
+                            PlantName = plantName,
+                            CurrentState = state,
+                            Action = action,
+                            Scale = scale,
+                            LastUpdateTime = DateTime.Now,
+                            FirstSeenTime = DateTime.Now
+                        };
+                    }
+                    else if (state == "Growing" && _pendingPlants.TryGetValue(entityId, out var pending))
+                    {
+                        // Pending plant just transitioned to Growing — this is ours!
+                        // (We watered/fertilized it, causing the rapid state change)
+                        double elapsed = (DateTime.Now - pending.LastUpdateTime).TotalSeconds;
+                        if (elapsed < 5) // within 5 seconds = our interaction
+                        {
+                            pending.CurrentState = state;
+                            pending.Action = action;
+                            pending.Scale = scale;
+                            pending.LastUpdateTime = DateTime.Now;
+                            plants[entityId] = pending;
+                        }
+                        _pendingPlants.Remove(entityId);
+                    }
+                    else if ((state == "Blooming" || state == "Ripe") && _pendingPlants.ContainsKey(entityId))
+                    {
+                        // Plant we were tracking went straight to harvestable
+                        var pending2 = _pendingPlants[entityId];
+                        pending2.CurrentState = state;
+                        pending2.Action = action;
+                        pending2.Scale = scale;
+                        pending2.LastUpdateTime = DateTime.Now;
+                        plants[entityId] = pending2;
+                        _pendingPlants.Remove(entityId);
+                    }
+                    // Otherwise: not our plant, ignore it
                 }
             }
         }
@@ -291,6 +330,13 @@ void ProcessLogLine(string line)
             }
             plants.Remove(id);
         }
+
+        // Clean up stale pending plants (seen >30s ago, never confirmed as ours)
+        var stalePending = _pendingPlants
+            .Where(kv => (DateTime.Now - kv.Value.LastUpdateTime).TotalSeconds > 30)
+            .Select(kv => kv.Key).ToList();
+        foreach (var id in stalePending)
+            _pendingPlants.Remove(id);
     }
 }
 
