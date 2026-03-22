@@ -1,0 +1,17 @@
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.user
+.vs/
+
+# Large game data files (downloaded from CDN at runtime)
+items.json
+recipes.json
+
+# Runtime state
+known_recipes.json
+
+# Memory exploration output
+memory/
