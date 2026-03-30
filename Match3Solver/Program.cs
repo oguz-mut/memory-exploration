@@ -123,9 +123,11 @@ void OnNewGame(int sessionId, Match3Config config)
         {
             // Solve-move-reread loop: solve 1 move at a time from actual board state
             await Task.Delay(500);
+            Console.WriteLine("[*] Entering solve-move loop...");
             while (true)
             {
                 // Read fresh board + turnsRemaining from game memory
+                Console.WriteLine("[*] Reading board...");
                 var fresh = QuickReadBoard(config);
                 if (fresh == null)
                 {
@@ -170,18 +172,49 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 Console.WriteLine($"[+] {turnsLeft} turns left: solved in {sw.ElapsedMilliseconds}ms — best score: {result.PredictedScore} ({result.BestMoves.Count} moves, {result.StatesExplored} states)");
 
-                // Execute only the FIRST move
+                // Validate first move against the ACTUAL read board before executing
                 var firstMove = result.BestMoves[0];
+                var validateBoard = new SimBoard(config.Width, config.Height, config.Pieces.Length,
+                    curPieces, config.Pieces.Select(p => p.Tier).ToArray(), (MonoRandom)curRng.Clone());
+                if (!validateBoard.IsMoveValid(firstMove.X, firstMove.Y, firstMove.Direction))
+                {
+                    Console.WriteLine($"[!] Move ({firstMove.X},{firstMove.Y}) {firstMove.Direction} is INVALID on actual board — PRNG divergence detected");
+                    // Log board for diagnostics
+                    var sb = new StringBuilder("[!] Board state: ");
+                    for (int y = config.Height - 1; y >= 0; y--)
+                    {
+                        for (int x = 0; x < config.Width; x++)
+                            sb.Append(curPieces[y * config.Width + x]).Append(' ');
+                        if (y > 0) sb.Append("| ");
+                    }
+                    Console.WriteLine(sb.ToString());
+                    // Re-read board and retry this iteration instead of aborting
+                    Console.WriteLine("[*] Re-reading board and re-solving...");
+                    await Task.Delay(1000);
+                    continue;
+                }
+
+                // Execute only the FIRST move
                 bool success = await GameAutoPlayer.ExecuteSingleMove(firstMove, config, () =>
                 {
                     var r = QuickReadBoard(config);
                     return r.HasValue ? (r.Value.pieces, r.Value.rng) : ((int[], MonoRandom)?)null;
-                }, _gridX, _gridY, _cellSize); // Note: lambda only needs pieces+rng for move validation
+                }, _gridX, _gridY, _cellSize);
+
+                if (success)
+                    session.ConsecutiveFailures = 0;
 
                 if (!success)
                 {
-                    Console.WriteLine("[!] Move failed — aborting");
-                    break;
+                    session.ConsecutiveFailures++;
+                    if (session.ConsecutiveFailures >= 3)
+                    {
+                        Console.WriteLine("[!] 3 consecutive move failures — aborting");
+                        break;
+                    }
+                    Console.WriteLine($"[!] Move failed ({session.ConsecutiveFailures}/3) — re-reading and retrying...");
+                    await Task.Delay(1000);
+                    continue;
                 }
             }
 
@@ -236,11 +269,17 @@ ProcessMemory? EnsureGameConnection()
     long ri64(ulong addr) => mem.ReadInt64(addr) ?? throw new Exception($"Read failed at 0x{addr:X}");
     ulong rptr(ulong addr) => mem.ReadPointer(addr) ?? throw new Exception($"Read failed at 0x{addr:X}");
 
-    // Step 1: Scan for RandomSeed value in memory
-    // The default scanner only searches Private regions; also search Mapped/Image if needed
+    // Step 1: Scan for RandomSeed value in memory (with retry — game may still be allocating)
     var seedBytes = BitConverter.GetBytes(config.RandomSeed);
-    var seedHits = _memScanner.ScanForBytePattern(seedBytes, maxResults: 200);
-    Console.WriteLine($"[*] Found {seedHits.Count} RandomSeed hits in Private regions");
+    List<MemoryLib.Models.ScanMatch> seedHits = new();
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        _memScanner.InvalidateRegionCache();
+        seedHits = _memScanner.ScanForBytePattern(seedBytes, maxResults: 200);
+        Console.WriteLine($"[*] Attempt {attempt + 1}: Found {seedHits.Count} RandomSeed hits in Private regions");
+        if (seedHits.Count > 0) break;
+        Thread.Sleep(1500); // wait for game to allocate objects
+    }
 
     if (seedHits.Count == 0)
     {
@@ -881,6 +920,7 @@ class GameSession
     public SolveStatus Status { get; set; }
     public string? ErrorMessage { get; set; }
     public DateTime ReceivedAt { get; set; }
+    public int ConsecutiveFailures { get; set; }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1643,11 +1683,19 @@ static class GameAutoPlayer
     /// are identical (board settled after animations), or <paramref name="timeoutMs"/> elapses.
     /// Returns the settled board state, or the last read on timeout (with a warning logged).
     /// </summary>
+    static bool PiecesEqual(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
+    }
+
     static async Task<(int[] pieces, MonoRandom rng)?> WaitForBoardSettle(
         Func<(int[] pieces, MonoRandom rng)?> readBoard,
-        int initialDelayMs = 1200,
+        int initialDelayMs = 2000,
         int pollIntervalMs = 300,
-        int timeoutMs = 6000)
+        int timeoutMs = 8000)
     {
         await Task.Delay(initialDelayMs);
 
@@ -1656,6 +1704,7 @@ static class GameAutoPlayer
 
         var elapsed = initialDelayMs;
         var prev = first;
+        int stableCount = 0; // require 2 consecutive identical reads
 
         while (elapsed < timeoutMs)
         {
@@ -1663,27 +1712,20 @@ static class GameAutoPlayer
             elapsed += pollIntervalMs;
 
             var next = readBoard();
-            if (next == null) return prev; // game over / unreadable
+            if (next == null) return prev;
 
-            bool settled = true;
-            var p1 = prev.Value.pieces;
-            var p2 = next.Value.pieces;
-            if (p1.Length != p2.Length)
+            if (PiecesEqual(prev.Value.pieces, next.Value.pieces))
             {
-                settled = false;
+                stableCount++;
+                if (stableCount >= 2) // two consecutive identical reads = truly settled
+                {
+                    Console.WriteLine($"[~] Board settled after {elapsed}ms ({stableCount} stable reads)");
+                    return next;
+                }
             }
             else
             {
-                for (int i = 0; i < p1.Length; i++)
-                {
-                    if (p1[i] != p2[i]) { settled = false; break; }
-                }
-            }
-
-            if (settled)
-            {
-                Console.WriteLine($"[~] Board settled after {elapsed}ms");
-                return next;
+                stableCount = 0; // reset — board is still changing
             }
 
             prev = next;
@@ -1730,6 +1772,9 @@ static class GameAutoPlayer
             int dstScreenY = gridY + (boardH - 1 - target.Y) * cellSize + cellSize / 2;
 
             Console.WriteLine($"[>] Move {i + 1}/{moves.Count}: ({move.X},{move.Y}) {move.Direction} → screen ({srcScreenX},{srcScreenY})→({dstScreenX},{dstScreenY})");
+
+            // Bring game window to foreground
+            FocusGameWindow();
 
             // Mouse drag
             SetCursorPos(srcScreenX, srcScreenY);
@@ -1824,6 +1869,9 @@ static class GameAutoPlayer
 
         Console.WriteLine($"[>] ({move.X},{move.Y}) {move.Direction} → screen ({srcScreenX},{srcScreenY})→({dstScreenX},{dstScreenY})");
 
+        // Bring game window to foreground
+        FocusGameWindow();
+
         // Execute drag
         SetCursorPos(srcScreenX, srcScreenY);
         await Task.Delay(80);
@@ -1877,6 +1925,29 @@ static class GameAutoPlayer
 
         Console.WriteLine($"[+] Verified — {changed} cells changed");
         return true;
+    }
+
+    static void FocusGameWindow()
+    {
+        IntPtr hwnd = IntPtr.Zero;
+        EnumWindows((h, _) =>
+        {
+            if (!IsWindowVisible(h)) return true;
+            GetWindowThreadProcessId(h, out uint pid);
+            try
+            {
+                var proc = Process.GetProcessById((int)pid);
+                if (proc.ProcessName.Equals("WindowsPlayer", StringComparison.OrdinalIgnoreCase))
+                {
+                    hwnd = h;
+                    return false; // stop enumeration
+                }
+            }
+            catch { }
+            return true;
+        }, IntPtr.Zero);
+        if (hwnd != IntPtr.Zero)
+            SetForegroundWindow(hwnd);
     }
 
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);
