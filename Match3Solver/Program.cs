@@ -596,6 +596,49 @@ ProcessMemory? EnsureGameConnection()
 
     try
     {
+        // Read PRNG state FIRST — before pieces and game state — so we capture the
+        // state that will generate the NEXT cascade fill, not one already advanced by
+        // a concurrent cascade fill happening between our reads.
+        MonoRandom rng;
+        bool rngReadOk = false;
+        if (_lastGameStateAddr != 0)
+        {
+            try
+            {
+                ulong rndPtr = rptr(_lastGameStateAddr + 0x38);
+                int inext = ri32(rndPtr + 0x10);
+                int inextp = ri32(rndPtr + 0x14);
+                ulong seedArrayPtr = rptr(rndPtr + 0x18);
+                long seedArrayLen = ri64(seedArrayPtr + 0x18);
+
+                if (seedArrayLen == 56 && inext >= 0 && inext < 56 && inextp >= 0 && inextp < 56)
+                {
+                    var seedArray = new int[56];
+                    for (int i = 0; i < 56; i++)
+                        seedArray[i] = ri32(seedArrayPtr + 0x20 + (ulong)(i * 4));
+                    rng = new MonoRandom(seedArray, inext, inextp);
+                    rngReadOk = true;
+                    Console.WriteLine($"[prng] inext={inext} inextp={inextp}");
+                }
+                else
+                {
+                    rng = new MonoRandom(config.RandomSeed);
+                }
+            }
+            catch
+            {
+                rng = new MonoRandom(config.RandomSeed);
+            }
+        }
+        else
+        {
+            rng = new MonoRandom(config.RandomSeed);
+        }
+
+        if (!rngReadOk)
+            Console.WriteLine("[!] QuickReadBoard: falling back to seed-based PRNG — cascade predictions may diverge");
+
+        // Read pieces array after PRNG so PRNG snapshot precedes any cascade fill
         ulong piecesArrayPtr = rptr(_lastBoardAddr + 0x28);
         long arrayLength = ri64(piecesArrayPtr + 0x18);
         int expectedLen = config.Width * config.Height;
@@ -655,46 +698,6 @@ ProcessMemory? EnsureGameConnection()
             }
             catch { /* use zeroed array if read fails */ }
         }
-
-        // Read live PRNG state from GameStateSinglePlayer.rnd (+0x38)
-        MonoRandom rng;
-        bool rngReadOk = false;
-        if (_lastGameStateAddr != 0)
-        {
-            try
-            {
-                ulong rndPtr = rptr(_lastGameStateAddr + 0x38);
-                int inext = ri32(rndPtr + 0x10);
-                int inextp = ri32(rndPtr + 0x14);
-                ulong seedArrayPtr = rptr(rndPtr + 0x18);
-                long seedArrayLen = ri64(seedArrayPtr + 0x18);
-
-                if (seedArrayLen == 56 && inext >= 0 && inext < 56 && inextp >= 0 && inextp < 56)
-                {
-                    var seedArray = new int[56];
-                    for (int i = 0; i < 56; i++)
-                        seedArray[i] = ri32(seedArrayPtr + 0x20 + (ulong)(i * 4));
-                    rng = new MonoRandom(seedArray, inext, inextp);
-                    rngReadOk = true;
-                    Console.WriteLine($"[prng] inext={inext} inextp={inextp}");
-                }
-                else
-                {
-                    rng = new MonoRandom(config.RandomSeed);
-                }
-            }
-            catch
-            {
-                rng = new MonoRandom(config.RandomSeed);
-            }
-        }
-        else
-        {
-            rng = new MonoRandom(config.RandomSeed);
-        }
-
-        if (!rngReadOk)
-            Console.WriteLine("[!] QuickReadBoard: falling back to seed-based PRNG — cascade predictions may diverge");
 
         return (pieces, rng, turnsRemaining, score, tier, turnsMade, totalPiecesMatched, tierPiecesMatched);
     }
@@ -1357,7 +1360,10 @@ class SimGameState
         if (result != MoveResult.Success) return result;
 
         IsExtraTurnEarned = false;
-        Chain = 0;
+        // Chain starts at 1: the game's chain field is 1 for the initial swap matches,
+        // 2 for first cascade, etc. ScoresPerChainLevel is 1-indexed in the game.
+        // Live data showed ~10pt gap per move consistent with off-by-one on chain index.
+        Chain = 1;
         var stepResults = new StepResults();
         while (Board.Step(stepResults))
         {
@@ -1436,6 +1442,7 @@ class Match3Solver
     private List<SolverMove> _bestPath = new();
     private Stopwatch _solveTimer = new();
     private const int SOLVE_TIMEOUT_MS = 10000;
+    private const int BEAM_TIMEOUT_MS = 5000;
 
     public SolverResult Solve(SimGameState initialState, Match3Config config)
     {
@@ -1452,13 +1459,17 @@ class Match3Solver
         }
         else if (config.NumTurns <= 8)
         {
-            strategy = $"Beam search (width 300, depth {config.NumTurns})";
-            BeamSearch(initialState, config.NumTurns, 300);
+            // Width 100 (down from 300): we only need best first move, re-solve each turn.
+            // 5s cap: good-enough first move in 3s beats optimal in 25s.
+            strategy = $"Beam search (width 100, depth {config.NumTurns}, 5s cap)";
+            BeamSearch(initialState, config.NumTurns, 100);
         }
         else
         {
-            strategy = $"Greedy + 3-turn lookahead (depth {config.NumTurns})";
-            GreedyLookahead(initialState, config.NumTurns, 3);
+            // Lookahead 2 (down from 3): enough to find the best first move, much faster.
+            // 5s cap ensures we return timely even on complex boards.
+            strategy = $"Greedy + 2-turn lookahead (depth {config.NumTurns}, 5s cap)";
+            GreedyLookahead(initialState, config.NumTurns, 2);
         }
 
         return new SolverResult
@@ -1499,6 +1510,7 @@ class Match3Solver
         var beam = new List<(SimGameState state, List<SolverMove> path)> { (initialState, new List<SolverMove>()) };
         for (int turn = 0; turn < totalTurns; turn++)
         {
+            if (_solveTimer.ElapsedMilliseconds > BEAM_TIMEOUT_MS) break;
             var candidates = new List<(SimGameState state, List<SolverMove> path, int score)>();
             foreach (var (state, path) in beam)
             {
@@ -1525,6 +1537,7 @@ class Match3Solver
         var path = new List<SolverMove>();
         for (int turn = 0; turn < totalTurns; turn++)
         {
+            if (_solveTimer.ElapsedMilliseconds > BEAM_TIMEOUT_MS) break;
             if (current.IsGameOver) break;
             var moves = current.Board.GetAllValidMoves();
             if (moves.Count == 0) break;
@@ -1532,6 +1545,7 @@ class Match3Solver
             (int x, int y, MoveDir dir) bestMove = moves[0];
             foreach (var (x, y, dir) in moves)
             {
+                if (_solveTimer.ElapsedMilliseconds > BEAM_TIMEOUT_MS) break;
                 _statesExplored++;
                 var clone = current.Clone();
                 clone.MakeMove(x, y, dir);
