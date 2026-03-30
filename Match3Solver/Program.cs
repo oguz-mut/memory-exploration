@@ -30,6 +30,7 @@ ProcessMemory? _gameMemory = null;
 MemoryRegionScanner? _memScanner = null;
 ulong _lastBoardAddr = 0; // cached GameBoard address for fast re-reads
 ulong _lastGameStateAddr = 0; // cached GameStateSinglePlayer address
+CancellationTokenSource? _gameCts = null; // per-game CTS to cancel stale solve-move tasks
 
 // Grid calibration (at 1920x1080 base resolution)
 int _gridX = 35, _gridY = 245, _cellSize = 46;
@@ -94,6 +95,13 @@ void OnNewGame(int sessionId, Match3Config config)
         Status = SolveStatus.Solving
     };
 
+    // Cancel any previously running solve-move task and clear cached addresses
+    _gameCts?.Cancel();
+    _gameCts = new CancellationTokenSource();
+    var gameCt = _gameCts.Token;
+    _lastBoardAddr = 0;
+    _lastGameStateAddr = 0;
+
     lock (_lock)
     {
         if (_currentSession != null)
@@ -103,6 +111,8 @@ void OnNewGame(int sessionId, Match3Config config)
 
     Task.Run(async () =>
     {
+        try
+        {
         // Wait for game to create board objects in memory
         await Task.Delay(1000);
 
@@ -124,8 +134,16 @@ void OnNewGame(int sessionId, Match3Config config)
             // Solve-move-reread loop: solve 1 move at a time from actual board state
             await Task.Delay(500);
             Console.WriteLine("[*] Entering solve-move loop...");
+            int lastPredictedFirstMoveScore = -1;
             while (true)
             {
+                // Check for cancellation (new game started)
+                if (gameCt.IsCancellationRequested)
+                {
+                    Console.WriteLine("[*] Game task cancelled (new game detected)");
+                    break;
+                }
+
                 // Read fresh board + turnsRemaining from game memory
                 Console.WriteLine("[*] Reading board...");
                 var fresh = QuickReadBoard(config);
@@ -136,6 +154,24 @@ void OnNewGame(int sessionId, Match3Config config)
                 }
                 var (curPieces, curRng, turnsLeft, curScore, curTier, curTurnsMade, curTotalMatched, curTierMatched) = fresh.Value;
                 session.InitialBoard = curPieces;
+
+                // Log compact board grid (top row first)
+                {
+                    var sbBoard = new StringBuilder("[board] ");
+                    for (int y = config.Height - 1; y >= 0; y--)
+                    {
+                        sbBoard.Append($"row{y}:");
+                        for (int x = 0; x < config.Width; x++)
+                            sbBoard.Append(' ').Append(curPieces[y * config.Width + x]);
+                        if (y > 0) sbBoard.Append(" |");
+                    }
+                    Console.WriteLine(sbBoard.ToString());
+                }
+
+                // Log score vs predicted divergence
+                Console.WriteLine($"[score] game={curScore} predicted={lastPredictedFirstMoveScore} tier={curTier}");
+                if (lastPredictedFirstMoveScore >= 0 && Math.Abs(curScore - lastPredictedFirstMoveScore) > 50)
+                    Console.WriteLine($"[!] Score divergence: game={curScore} vs last_predicted={lastPredictedFirstMoveScore}");
 
                 if (turnsLeft <= 0)
                 {
@@ -172,6 +208,9 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 Console.WriteLine($"[+] {turnsLeft} turns left: solved in {sw.ElapsedMilliseconds}ms — best score: {result.PredictedScore} ({result.BestMoves.Count} moves, {result.StatesExplored} states)");
 
+                // Track the score predicted for after this move for divergence detection next iteration
+                lastPredictedFirstMoveScore = result.BestMoves[0].ScoreAfter;
+
                 // Validate first move against the ACTUAL read board before executing
                 var firstMove = result.BestMoves[0];
                 var validateBoard = new SimBoard(config.Width, config.Height, config.Pieces.Length,
@@ -188,10 +227,20 @@ void OnNewGame(int sessionId, Match3Config config)
                         if (y > 0) sb.Append("| ");
                     }
                     Console.WriteLine(sb.ToString());
+                    // Also log all valid moves from the actual board
+                    var validMoves = validateBoard.GetAllValidMoves();
+                    Console.WriteLine($"[!] Valid moves on actual board ({validMoves.Count}): {string.Join(", ", validMoves.Select(m => $"({m.x},{m.y}){m.dir}"))}");
                     // Re-read board and retry this iteration instead of aborting
                     Console.WriteLine("[*] Re-reading board and re-solving...");
                     await Task.Delay(1000);
                     continue;
+                }
+
+                // Check cancellation before executing mouse move
+                if (gameCt.IsCancellationRequested)
+                {
+                    Console.WriteLine("[*] Game task cancelled before move execution");
+                    break;
                 }
 
                 // Execute only the FIRST move
@@ -199,7 +248,7 @@ void OnNewGame(int sessionId, Match3Config config)
                 {
                     var r = QuickReadBoard(config);
                     return r.HasValue ? (r.Value.pieces, r.Value.rng) : ((int[], MonoRandom)?)null;
-                }, _gridX, _gridY, _cellSize);
+                }, _gridX, _gridY, _cellSize, curPieces);
 
                 if (success)
                     session.ConsecutiveFailures = 0;
@@ -225,6 +274,11 @@ void OnNewGame(int sessionId, Match3Config config)
             session.Status = SolveStatus.Error;
             session.ErrorMessage = ex.Message;
             Console.WriteLine($"[!] Solver error: {ex.Message}");
+        }
+        } // end try (OperationCanceledException wrapper)
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[*] Game task cancelled via CancellationToken");
         }
     });
 }
@@ -622,6 +676,7 @@ ProcessMemory? EnsureGameConnection()
                         seedArray[i] = ri32(seedArrayPtr + 0x20 + (ulong)(i * 4));
                     rng = new MonoRandom(seedArray, inext, inextp);
                     rngReadOk = true;
+                    Console.WriteLine($"[prng] inext={inext} inextp={inextp}");
                 }
                 else
                 {
@@ -1847,7 +1902,7 @@ static class GameAutoPlayer
     }
 
     /// <summary>Execute a single move, verify via memory. Returns true if board changed.</summary>
-    public static async Task<bool> ExecuteSingleMove(SolverMove move, Match3Config config, Func<(int[] pieces, MonoRandom rng)?> readBoard, int baseGridX, int baseGridY, int baseCellSize)
+    public static async Task<bool> ExecuteSingleMove(SolverMove move, Match3Config config, Func<(int[] pieces, MonoRandom rng)?> readBoard, int baseGridX, int baseGridY, int baseCellSize, int[]? knownPrePieces = null)
     {
         int boardW = config.Width, boardH = config.Height;
         int winW = GetSystemMetrics(0), winH = GetSystemMetrics(1);
@@ -1856,10 +1911,18 @@ static class GameAutoPlayer
         int gridX = (int)(baseGridX * scaleX);
         int gridY = (int)(baseGridY * scaleY);
 
-        // Read board before move
-        var preMaybe = readBoard();
-        if (preMaybe == null) return false;
-        var prePieces = preMaybe.Value.pieces;
+        // Use already-read pre-move board if provided, otherwise read fresh
+        int[] prePieces;
+        if (knownPrePieces != null)
+        {
+            prePieces = knownPrePieces;
+        }
+        else
+        {
+            var preMaybe = readBoard();
+            if (preMaybe == null) return false;
+            prePieces = preMaybe.Value.pieces;
+        }
 
         int srcScreenX = gridX + move.X * cellSize + cellSize / 2;
         int srcScreenY = gridY + (boardH - 1 - move.Y) * cellSize + cellSize / 2;
@@ -1897,6 +1960,10 @@ static class GameAutoPlayer
 
         if (changed == 0)
         {
+            var target2 = SimBoard.DeltaByDir(move.X, move.Y, move.Direction);
+            int srcType = (move.X >= 0 && move.X < boardW && move.Y >= 0 && move.Y < boardH) ? prePieces[move.Y * boardW + move.X] : -99;
+            int dstType = (target2.X >= 0 && target2.X < boardW && target2.Y >= 0 && target2.Y < boardH) ? prePieces[target2.Y * boardW + target2.X] : -99;
+            Console.WriteLine($"[!] Move ({move.X},{move.Y}) {move.Direction}: src_type={srcType} dst_type={dstType} — game rejected swap");
             Console.WriteLine($"[!] Board UNCHANGED — retrying with overshoot...");
             await Task.Delay(500);
             int overX = dstScreenX + (dstScreenX - srcScreenX) * 3 / 10;
@@ -1920,7 +1987,7 @@ static class GameAutoPlayer
             changed = 0;
             for (int j = 0; j < prePieces.Length && j < postMaybe.Value.pieces.Length; j++)
                 if (prePieces[j] != postMaybe.Value.pieces[j]) changed++;
-            if (changed == 0) { Console.WriteLine("[!] Retry also failed"); return false; }
+            if (changed == 0) { Console.WriteLine($"[!] Retry also failed — move ({move.X},{move.Y}) {move.Direction} board still unchanged"); return false; }
         }
 
         Console.WriteLine($"[+] Verified — {changed} cells changed");
