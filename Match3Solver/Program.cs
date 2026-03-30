@@ -1227,6 +1227,14 @@ class SimGameState
         TierPiecesMatched = tierPiecesMatched.Length == config.Pieces.Length
             ? (int[])tierPiecesMatched.Clone() : new int[config.Pieces.Length];
         PiecesTiered = new bool[config.Pieces.Length];
+        // Reconstruct PiecesTiered from live tierPiecesMatched so FindTierUp() knows
+        // which pieces already met the threshold in the current tier
+        if (tier < config.PieceReqsPerTier.Length)
+        {
+            int req = config.PieceReqsPerTier[tier];
+            for (int i = 0; i < activePieces && i < TierPiecesMatched.Length; i++)
+                PiecesTiered[i] = TierPiecesMatched[i] >= req;
+        }
     }
 
     public SimGameState() { }
