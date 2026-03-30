@@ -1631,6 +1631,61 @@ static class GameAutoPlayer
     }
 
     /// <summary>
+    /// Polls the board every <paramref name="pollIntervalMs"/> ms until two consecutive reads
+    /// are identical (board settled after animations), or <paramref name="timeoutMs"/> elapses.
+    /// Returns the settled board state, or the last read on timeout (with a warning logged).
+    /// </summary>
+    static async Task<(int[] pieces, MonoRandom rng)?> WaitForBoardSettle(
+        Func<(int[] pieces, MonoRandom rng)?> readBoard,
+        int initialDelayMs = 1200,
+        int pollIntervalMs = 300,
+        int timeoutMs = 6000)
+    {
+        await Task.Delay(initialDelayMs);
+
+        var first = readBoard();
+        if (first == null) return null;
+
+        var elapsed = initialDelayMs;
+        var prev = first;
+
+        while (elapsed < timeoutMs)
+        {
+            await Task.Delay(pollIntervalMs);
+            elapsed += pollIntervalMs;
+
+            var next = readBoard();
+            if (next == null) return prev; // game over / unreadable
+
+            bool settled = true;
+            var p1 = prev.Value.pieces;
+            var p2 = next.Value.pieces;
+            if (p1.Length != p2.Length)
+            {
+                settled = false;
+            }
+            else
+            {
+                for (int i = 0; i < p1.Length; i++)
+                {
+                    if (p1[i] != p2[i]) { settled = false; break; }
+                }
+            }
+
+            if (settled)
+            {
+                Console.WriteLine($"[~] Board settled after {elapsed}ms");
+                return next;
+            }
+
+            prev = next;
+        }
+
+        Console.WriteLine($"[!] Board settle timeout after {elapsed}ms — using last read");
+        return prev;
+    }
+
+    /// <summary>
     /// Finds the board grid on screen and executes each move as a mouse drag.
     /// Uses the "Lootmaster" or "Cashfall" title text in the popup header to anchor position.
     /// </summary>
@@ -1685,9 +1740,7 @@ static class GameAutoPlayer
             MouseUp();
 
             // Wait for match + cascade animations to complete
-            await Task.Delay(3500);
-
-            var postBoard = readBoard();
+            var postBoard = await WaitForBoardSettle(readBoard);
             if (postBoard == null)
             {
                 Console.WriteLine($"[!] Move {i + 1}: can't read board after move (game over?)");
@@ -1718,9 +1771,8 @@ static class GameAutoPlayer
                 }
                 await Task.Delay(120);
                 MouseUp();
-                await Task.Delay(3500);
+                postBoard = await WaitForBoardSettle(readBoard);
 
-                postBoard = readBoard();
                 if (postBoard != null)
                 {
                     changed = 0;
@@ -1735,7 +1787,7 @@ static class GameAutoPlayer
             }
 
             Console.WriteLine($"[+] Move {i + 1}: verified — {changed} cells changed");
-            currentPieces = postBoard.Value.pieces;
+            currentPieces = postBoard!.Value.pieces;
         }
 
         Console.WriteLine($"[+] Auto-play: done");
@@ -1779,10 +1831,9 @@ static class GameAutoPlayer
         }
         await Task.Delay(80);
         MouseUp();
-        await Task.Delay(3500);
 
-        // Verify
-        var postMaybe = readBoard();
+        // Wait for match + cascade animations to complete
+        var postMaybe = await WaitForBoardSettle(readBoard);
         if (postMaybe == null) return false;
         int changed = 0;
         for (int j = 0; j < prePieces.Length && j < postMaybe.Value.pieces.Length; j++)
@@ -1807,9 +1858,8 @@ static class GameAutoPlayer
             }
             await Task.Delay(120);
             MouseUp();
-            await Task.Delay(3500);
+            postMaybe = await WaitForBoardSettle(readBoard);
 
-            postMaybe = readBoard();
             if (postMaybe == null) return false;
             changed = 0;
             for (int j = 0; j < prePieces.Length && j < postMaybe.Value.pieces.Length; j++)
