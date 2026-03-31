@@ -136,6 +136,9 @@ void OnNewGame(int sessionId, Match3Config config)
             await Task.Delay(500);
             Console.WriteLine("[*] Entering solve-move loop...");
             int lastPredictedFirstMoveScore = -1;
+            Task<SolverResult?>? precomputeTask = null;
+            SimGameState? predictedNextState = null;
+            int[]? predictedNextPieces = null;
             while (true)
             {
                 // Check for cancellation (new game started)
@@ -197,6 +200,37 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 SolverResult result;
                 string stratLabel;
+
+                // Check if pre-computed solution matches actual board
+                if (precomputeTask != null && predictedNextPieces != null)
+                {
+                    var precomputedResult = precomputeTask.Result;
+                    precomputeTask = null;
+
+                    if (precomputedResult != null && precomputedResult.BestMoves.Count > 0)
+                    {
+                        bool piecesMatch = curPieces.Length == predictedNextPieces.Length;
+                        if (piecesMatch)
+                        {
+                            for (int j = 0; j < curPieces.Length; j++)
+                                if (curPieces[j] != predictedNextPieces[j]) { piecesMatch = false; break; }
+                        }
+
+                        if (piecesMatch)
+                        {
+                            Console.WriteLine("[>>] Using pre-computed solution (board matched prediction)");
+                            result = precomputedResult;
+                            stratLabel = "precomputed";
+                            goto skipSolve;
+                        }
+                        else
+                        {
+                            Console.WriteLine("[~] Pre-computed solution discarded (board diverged)");
+                        }
+                    }
+                    predictedNextPieces = null;
+                }
+
                 if (_strategy == SolverStrategy.Auto)
                 {
                     // Auto: use MCTS for low turns (≤4), Iterative for everything else.
@@ -249,6 +283,7 @@ void OnNewGame(int sessionId, Match3Config config)
                     stratLabel = _strategy.ToString().ToLower();
                 }
 
+                skipSolve:
                 sw.Stop();
                 result.SolveTime = sw.Elapsed;
                 session.Solution = result;
@@ -295,6 +330,29 @@ void OnNewGame(int sessionId, Match3Config config)
                 {
                     Console.WriteLine("[*] Game task cancelled before move execution");
                     break;
+                }
+
+                // Speculatively pre-compute the next solve while we execute + settle
+                {
+                    var preState = state.Clone();
+                    preState.MakeMove(firstMove.X, firstMove.Y, firstMove.Direction);
+                    if (!preState.IsGameOver && preState.TurnsRemaining > 0)
+                    {
+                        predictedNextState = preState;
+                        predictedNextPieces = preState.Board.GetPiecesArray();
+                        var preConfig = solveConfig;
+                        precomputeTask = Task.Run(() =>
+                        {
+                            try
+                            {
+                                if (preState.TurnsRemaining <= 4)
+                                    return (SolverResult?)new MCTSSolver().Solve(preState, preConfig, 5000);
+                                else
+                                    return (SolverResult?)new IterativeSolver().Solve(preState, preConfig, 5000);
+                            }
+                            catch { return null; }
+                        });
+                    }
                 }
 
                 // Execute only the FIRST move
