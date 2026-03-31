@@ -2,14 +2,13 @@ using System.Diagnostics;
 
 // ═══════════════════════════════════════════════════════════════════
 // MCTSSolver — Monte Carlo Tree Search with exact first cascade
-//              + UCB1 parallel playouts, lightweight neighbor-count
-//              heuristic move selection, and adaptive time allocation
+//              + UCB1 parallel playouts, clone-based greedy move
+//              selection, and adaptive time allocation
 // ═══════════════════════════════════════════════════════════════════
 
 class MCTSSolver
 {
     private const double UCB1_C      = 1.41;        // exploration constant sqrt(2)
-    private const double SCORE_NORM  = 10_000.0;    // normalisation for UCB1 balance
     private const double EPSILON     = 0.30;        // fraction of random (exploration) playout moves
     private const int    BONUS_MULTI = 3;           // multiplier for moves creating 4+ matches
 
