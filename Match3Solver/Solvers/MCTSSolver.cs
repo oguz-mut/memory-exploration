@@ -2,14 +2,13 @@ using System.Diagnostics;
 
 // ═══════════════════════════════════════════════════════════════════
 // MCTSSolver — Monte Carlo Tree Search with exact first cascade
-//              + UCB1 parallel playouts, lightweight neighbor-count
-//              heuristic move selection, and adaptive time allocation
+//              + UCB1 parallel playouts, clone-based greedy move
+//              selection, and adaptive time allocation
 // ═══════════════════════════════════════════════════════════════════
 
 class MCTSSolver
 {
     private const double UCB1_C      = 1.41;        // exploration constant sqrt(2)
-    private const double SCORE_NORM  = 10_000.0;    // normalisation for UCB1 balance
     private const double EPSILON     = 0.30;        // fraction of random (exploration) playout moves
     private const int    BONUS_MULTI = 3;           // multiplier for moves creating 4+ matches
 
@@ -93,6 +92,31 @@ class MCTSSolver
         }
 
         // ─────────────────────────────────────────────────────────────
+        // Compute dynamic normalization from observed scores
+        // ─────────────────────────────────────────────────────────────
+        double maxObservedScore = 0.0;
+
+        // Check phase 1 scores
+        for (int i = 0; i < n; i++)
+        {
+            if (scoreAfterFirstMove[i] > maxObservedScore)
+                maxObservedScore = scoreAfterFirstMove[i];
+        }
+
+        // Check warm-up playout averages
+        for (int i = 0; i < n; i++)
+        {
+            if (playoutCount[i] > 0)
+            {
+                double avg = (double)totalPlayoutScore[i] / playoutCount[i];
+                if (avg > maxObservedScore)
+                    maxObservedScore = avg;
+            }
+        }
+
+        double dynamicNorm = Math.Max(1000.0, maxObservedScore * 3.0);
+
+        // ─────────────────────────────────────────────────────────────
         // Phase 3: parallel UCB1-guided playout loop
         // Task 1: multi-threaded execution
         // ─────────────────────────────────────────────────────────────
@@ -111,7 +135,7 @@ class MCTSSolver
                 {
                     // Read shared arrays without lock — approximate UCB1 is fine
                     int snap = Volatile.Read(ref totalPlayoutsShared);
-                    int pick = SelectUCB1(totalPlayoutScore, playoutCount, snap, n);
+                    int pick = SelectUCB1(totalPlayoutScore, playoutCount, snap, n, dynamicNorm);
 
                     if (postMoveStates[pick].IsGameOver)
                     {
@@ -174,7 +198,7 @@ class MCTSSolver
     // Reads shared arrays without lock — approximate reads are OK.
     // ───────────────────────────────────────────────────────────────
 
-    private static int SelectUCB1(long[] totalScore, int[] counts, int totalN, int n)
+    private static int SelectUCB1(long[] totalScore, int[] counts, int totalN, int n, double dynamicNorm)
     {
         double logTotal = Math.Log(totalN + 1); // +1 avoids log(0)
         double bestUCB  = double.MinValue;
@@ -188,7 +212,7 @@ class MCTSSolver
                 ? UCB1_C * Math.Sqrt(logTotal / c)
                 : double.MaxValue / 2; // unvisited → force visit
 
-            double ucb = avg / SCORE_NORM + exploration;
+            double ucb = avg / dynamicNorm + exploration;
             if (ucb > bestUCB) { bestUCB = ucb; bestIdx = i; }
         }
 
