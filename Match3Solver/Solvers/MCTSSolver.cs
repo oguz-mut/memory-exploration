@@ -2,24 +2,36 @@ using System.Diagnostics;
 
 // ═══════════════════════════════════════════════════════════════════
 // MCTSSolver — Monte Carlo Tree Search with exact first cascade
-//              + epsilon-greedy playouts, UCB1 allocation,
-//              and extra turn bonus scoring
+//              + UCB1 parallel playouts, lightweight neighbor-count
+//              heuristic move selection, and adaptive time allocation
 // ═══════════════════════════════════════════════════════════════════
 
 class MCTSSolver
 {
-    private const double UCB1_C = 1.41;          // exploration constant sqrt(2)
-    private const double SCORE_NORM = 10_000.0;  // normalisation for UCB1 balance
-    private const double EPSILON = 0.30;         // fraction of random (exploration) playout moves
-    private const int GREEDY_CANDIDATES = 5;     // candidates evaluated in greedy selection
+    private const double UCB1_C      = 1.41;        // exploration constant sqrt(2)
+    private const double SCORE_NORM  = 10_000.0;    // normalisation for UCB1 balance
+    private const double EPSILON     = 0.30;        // fraction of random (exploration) playout moves
+    private const int    BONUS_MULTI = 3;           // multiplier for moves creating 4+ matches
 
     /// <summary>
     /// Solve using MCTS: exact first cascade (real PRNG clone), then UCB1-guided
-    /// playout allocation with epsilon-greedy move selection inside each playout.
-    /// Extra turns earned during playouts receive a score bonus.
+    /// parallel playout allocation.  Move selection inside playouts uses a cheap
+    /// neighbor-count heuristic instead of clone-5 epsilon-greedy.
+    /// Adaptive time budget: 60 % more time when ≤2 turns remain, 40 % for 3 turns.
     /// </summary>
     public SolverResult Solve(SimGameState state, Match3Config config, int timeBudgetMs = 3000)
     {
+        if (timeBudgetMs <= 0) timeBudgetMs = 3000;
+
+        // Task 3: Adaptive time allocation — endgame decisions are more impactful
+        int adaptiveMs = state.TurnsRemaining switch
+        {
+            <= 2 => (int)(timeBudgetMs * 1.6),  // 4.8s at default budget
+            3    => (int)(timeBudgetMs * 1.4),  // 4.2s
+            4    => (int)(timeBudgetMs * 1.2),  // 3.6s
+            _    => timeBudgetMs
+        };
+
         var sw = Stopwatch.StartNew();
 
         var validMoves = state.Board.GetAllValidMoves();
@@ -27,121 +39,139 @@ class MCTSSolver
         {
             return new SolverResult
             {
-                BestMoves = new List<SolverMove>(),
-                PredictedScore = state.Score,
-                StatesExplored = 0,
-                Strategy = $"MCTS-UCB1 (0 playouts, {timeBudgetMs}ms) — no valid moves"
+                BestMoves       = new List<SolverMove>(),
+                PredictedScore  = state.Score,
+                StatesExplored  = 0,
+                Strategy        = $"MCTS-UCB1-Par (0 playouts, {adaptiveMs}ms) — no valid moves"
             };
         }
 
         int n = validMoves.Count;
 
-        // Per-move accumulators
+        // Per-move accumulators (long to avoid overflow with many parallel playouts)
         var scoreAfterFirstMove = new int[n];
         var totalPlayoutScore   = new long[n];
         var playoutCount        = new int[n];
-        var statesAfterMove     = new SimGameState[n];
+        var postMoveStates      = new SimGameState[n];
 
-        // Bonus per extra turn earned during a playout
         int extraTurnBonus = config.ScoreFor4s * 2;
 
-        // Phase 1: exact cascade for every candidate move (uses real cloned PRNG)
+        // ─────────────────────────────────────────────────────────────
+        // Phase 1: exact cascade for every candidate move (real PRNG)
+        // ─────────────────────────────────────────────────────────────
         for (int i = 0; i < n; i++)
         {
             var (x, y, dir) = validMoves[i];
             var clone = state.Clone();
             clone.MakeMove(x, y, dir);
-            statesAfterMove[i] = clone;
+            postMoveStates[i]      = clone;
             scoreAfterFirstMove[i] = clone.Score;
         }
 
-        var rng = new Random();
-        int totalPlayouts = 0;
+        // ─────────────────────────────────────────────────────────────
+        // Phase 2: warm-up — 3 playouts per move (single-threaded)
+        // ─────────────────────────────────────────────────────────────
+        var warmupRng = new Random();
+        int totalPlayoutsShared = 0;
 
-        // Phase 2: give each move the minimum 3 playouts (UCB1 initialisation)
         for (int i = 0; i < n; i++)
         {
-            if (statesAfterMove[i].IsGameOver)
+            if (postMoveStates[i].IsGameOver)
             {
                 totalPlayoutScore[i] = scoreAfterFirstMove[i] * 3L;
-                playoutCount[i] = 3;
-                totalPlayouts += 3;
+                playoutCount[i]      = 3;
+                totalPlayoutsShared += 3;
                 continue;
             }
 
             for (int p = 0; p < 3; p++)
             {
-                totalPlayoutScore[i] += RunPlayout(statesAfterMove[i], rng, extraTurnBonus);
+                totalPlayoutScore[i] += RunPlayout(postMoveStates[i], warmupRng, extraTurnBonus);
                 playoutCount[i]++;
-                totalPlayouts++;
+                totalPlayoutsShared++;
             }
         }
 
-        // Phase 3: UCB1-guided playout allocation until time budget exhausted
-        while (sw.ElapsedMilliseconds < timeBudgetMs)
+        // ─────────────────────────────────────────────────────────────
+        // Phase 3: parallel UCB1-guided playout loop
+        // Task 1: multi-threaded execution
+        // ─────────────────────────────────────────────────────────────
+        int threadCount = Math.Max(1, Environment.ProcessorCount - 2);
+        var threads     = new Thread[threadCount];
+
+        for (int t = 0; t < threadCount; t++)
         {
-            // Select move with highest UCB1 score
-            int pick = SelectUCB1(totalPlayoutScore, playoutCount, totalPlayouts, n);
-
-            if (statesAfterMove[pick].IsGameOver)
+            int threadId = t;
+            threads[t] = new Thread(() =>
             {
-                // No improvement possible; give a small round-robin nudge so we
-                // don't spin forever on a finished state
-                pick = totalPlayouts % n;
-                if (!statesAfterMove[pick].IsGameOver)
-                {
-                    totalPlayoutScore[pick] += RunPlayout(statesAfterMove[pick], rng, extraTurnBonus);
-                    playoutCount[pick]++;
-                    totalPlayouts++;
-                }
-                else
-                {
-                    totalPlayouts++; // avoid infinite loop when all states are over
-                }
-                continue;
-            }
+                // Each thread gets its own Random — Random is not thread-safe
+                var rng = new Random(Environment.TickCount ^ threadId);
 
-            totalPlayoutScore[pick] += RunPlayout(statesAfterMove[pick], rng, extraTurnBonus);
-            playoutCount[pick]++;
-            totalPlayouts++;
+                while (sw.ElapsedMilliseconds < adaptiveMs)
+                {
+                    // Read shared arrays without lock — approximate UCB1 is fine
+                    int snap = Volatile.Read(ref totalPlayoutsShared);
+                    int pick = SelectUCB1(totalPlayoutScore, playoutCount, snap, n);
+
+                    if (postMoveStates[pick].IsGameOver)
+                    {
+                        // Spin-safe: bump the counter so we don't loop forever
+                        Interlocked.Increment(ref totalPlayoutsShared);
+                        continue;
+                    }
+
+                    // Clone is independent — no shared mutation
+                    var playoutState = postMoveStates[pick].Clone();
+                    int score = RunPlayout(playoutState, rng, extraTurnBonus);
+
+                    Interlocked.Add(ref totalPlayoutScore[pick], score);
+                    Interlocked.Increment(ref playoutCount[pick]);
+                    Interlocked.Increment(ref totalPlayoutsShared);
+                }
+            });
+            threads[t].IsBackground = true;
+            threads[t].Start();
         }
 
-        // Pick the move with the highest average score (exploitation — not UCB1)
-        int bestIdx = 0;
+        foreach (var th in threads) th.Join();
+
+        int totalPlayouts = Volatile.Read(ref totalPlayoutsShared);
+
+        // ─────────────────────────────────────────────────────────────
+        // Select best move by highest average (exploitation)
+        // ─────────────────────────────────────────────────────────────
+        int    bestIdx = 0;
         double bestAvg = double.MinValue;
         for (int i = 0; i < n; i++)
         {
             double avg = playoutCount[i] > 0
                 ? (double)totalPlayoutScore[i] / playoutCount[i]
                 : 0.0;
-            if (avg > bestAvg)
-            {
-                bestAvg = avg;
-                bestIdx = i;
-            }
+            if (avg > bestAvg) { bestAvg = avg; bestIdx = i; }
         }
 
         var (bx, by, bdir) = validMoves[bestIdx];
         var bestMove = new SolverMove
         {
-            X = bx,
-            Y = by,
-            Direction = bdir,
+            X          = bx,
+            Y          = by,
+            Direction  = bdir,
             ScoreAfter = scoreAfterFirstMove[bestIdx],
-            Description = $"MCTS-UCB1 best ({playoutCount[bestIdx]} playouts, avg {bestAvg:F0})"
+            Description = $"MCTS-UCB1-Par best ({playoutCount[bestIdx]} playouts, avg {bestAvg:F0})"
         };
 
         return new SolverResult
         {
-            BestMoves = new List<SolverMove> { bestMove },
+            BestMoves      = new List<SolverMove> { bestMove },
             PredictedScore = (int)Math.Round(bestAvg),
             StatesExplored = totalPlayouts,
-            Strategy = $"MCTS-UCB1 ({totalPlayouts} playouts, {timeBudgetMs}ms)"
+            Strategy       = $"MCTS-UCB1-Par ({totalPlayouts} playouts, {adaptiveMs}ms, {threadCount}t)"
         };
     }
 
     // ───────────────────────────────────────────────────────────────
     // UCB1 selection
+    // Reads shared arrays without lock — approximate reads are OK.
     // ───────────────────────────────────────────────────────────────
 
     private static int SelectUCB1(long[] totalScore, int[] counts, int totalN, int n)
@@ -152,35 +182,34 @@ class MCTSSolver
 
         for (int i = 0; i < n; i++)
         {
-            double avg = counts[i] > 0 ? (double)totalScore[i] / counts[i] : 0.0;
-            double exploration = counts[i] > 0
-                ? UCB1_C * Math.Sqrt(logTotal / counts[i])
+            int c = Volatile.Read(ref counts[i]);
+            double avg = c > 0 ? (double)Volatile.Read(ref totalScore[i]) / c : 0.0;
+            double exploration = c > 0
+                ? UCB1_C * Math.Sqrt(logTotal / c)
                 : double.MaxValue / 2; // unvisited → force visit
 
             double ucb = avg / SCORE_NORM + exploration;
-            if (ucb > bestUCB)
-            {
-                bestUCB = ucb;
-                bestIdx = i;
-            }
+            if (ucb > bestUCB) { bestUCB = ucb; bestIdx = i; }
         }
 
         return bestIdx;
     }
 
     // ───────────────────────────────────────────────────────────────
-    // Epsilon-greedy playout with extra turn bonus
+    // Playout with lightweight neighbor-count heuristic
+    // Task 2: replaces expensive clone-5 epsilon-greedy
     // ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Run a single playout from the given post-first-move state to game over.
-    /// Uses epsilon-greedy move selection: 70% greedy (best of GREEDY_CANDIDATES
-    /// random candidates), 30% fully random.
-    /// Returns the playout score augmented with extra-turn bonuses.
+    /// Run a single playout to game over using:
+    ///   30 % random (epsilon), 70 % greedy by neighbor-count heuristic.
+    /// The heuristic scores each move by how long a run the swapped
+    /// piece would create in each axis — O(board_dim) per move, no clone needed.
+    /// 4+ length moves get a x3 bonus (extra-turn value).
     /// </summary>
     private static int RunPlayout(SimGameState startState, Random rng, int extraTurnBonus)
     {
-        var playout = startState.Clone();
+        var playout       = startState.Clone();
         int extraTurnCount = 0;
 
         while (!playout.IsGameOver)
@@ -188,21 +217,17 @@ class MCTSSolver
             var moves = playout.Board.GetAllValidMoves();
             if (moves.Count == 0) break;
 
-            int pick;
+            (int x, int y, MoveDir dir) chosen;
             if (moves.Count == 1 || rng.NextDouble() < EPSILON)
             {
-                // 30%: fully random
-                pick = rng.Next(moves.Count);
+                chosen = moves[rng.Next(moves.Count)];
             }
             else
             {
-                // 70%: greedy — evaluate up to GREEDY_CANDIDATES random candidates,
-                //      pick the one with the highest immediate score delta
-                pick = GreedyPick(playout, moves, rng);
+                chosen = PickPlayoutMove(playout.Board, moves, rng);
             }
 
-            var (x, y, dir) = moves[pick];
-            playout.MakeMove(x, y, dir);
+            playout.MakeMove(chosen.x, chosen.y, chosen.dir);
 
             if (playout.IsExtraTurnEarned)
                 extraTurnCount++;
@@ -212,44 +237,69 @@ class MCTSSolver
     }
 
     /// <summary>
-    /// Sample up to GREEDY_CANDIDATES moves from the move list, evaluate each by
-    /// cloning the state and calling MakeMove, then return the index of the move
-    /// with the best immediate score delta.
+    /// Score each move by the run length the swapped pieces would form, then
+    /// return the move with the highest score.  No board clone required — the
+    /// heuristic inspects neighbors without mutating the board.
+    /// 4+ length bonus: multiply score by BONUS_MULTI (extra-turn value).
     /// </summary>
-    private static int GreedyPick(
-        SimGameState state,
+    private static (int x, int y, MoveDir dir) PickPlayoutMove(
+        SimBoard board,
         List<(int x, int y, MoveDir dir)> moves,
         Random rng)
     {
-        int candidateCount = Math.Min(GREEDY_CANDIDATES, moves.Count);
+        int bestMoveIdx = 0;
+        int bestScore   = -1;
 
-        // Reservoir-sample candidate indices without replacement
-        int[] indices = new int[candidateCount];
-        for (int i = 0; i < candidateCount; i++) indices[i] = i;
-        for (int i = candidateCount; i < moves.Count; i++)
+        for (int i = 0; i < moves.Count; i++)
         {
-            int j = rng.Next(i + 1);
-            if (j < candidateCount) indices[j] = i;
-        }
+            var (mx, my, mdir) = moves[i];
+            var target = SimBoard.DeltaByDir(mx, my, mdir);
 
-        int bestIdx   = indices[0];
-        int bestDelta = int.MinValue;
-        int baseScore = state.Score;
+            int type1 = board.Get(mx, my);
+            int type2 = board.Get(target.X, target.Y);
 
-        for (int c = 0; c < candidateCount; c++)
-        {
-            int idx = indices[c];
-            var (x, y, dir) = moves[idx];
-            var clone = state.Clone();
-            clone.MakeMove(x, y, dir);
-            int delta = clone.Score - baseScore;
-            if (delta > bestDelta)
+            // Run length for piece1 landing at target position
+            int run1 = CountRunLength(board, target.X, target.Y, type1);
+            // Run length for piece2 landing at source position
+            int run2 = CountRunLength(board, mx, my, type2);
+
+            int score = run1 + run2;
+
+            // Bonus for 4+ match (grants an extra turn)
+            if (run1 >= 4 || run2 >= 4)
+                score *= BONUS_MULTI;
+
+            if (score > bestScore)
             {
-                bestDelta = delta;
-                bestIdx   = idx;
+                bestScore   = score;
+                bestMoveIdx = i;
             }
         }
 
-        return bestIdx;
+        return moves[bestMoveIdx];
+    }
+
+    /// <summary>
+    /// Returns the maximum run length (horizontal or vertical) that a piece of
+    /// <paramref name="type"/> would form if placed at (x, y), treating the
+    /// current occupant as already replaced.  O(Width + Height).
+    /// </summary>
+    private static int CountRunLength(SimBoard board, int x, int y, int type)
+    {
+        // Horizontal run
+        int left  = 0;
+        int right = 0;
+        for (int dx = x - 1; dx >= 0          && board.Get(dx, y) == type; dx--) left++;
+        for (int dx = x + 1; dx < board.Width  && board.Get(dx, y) == type; dx++) right++;
+        int horizLen = left + right + 1;
+
+        // Vertical run
+        int down = 0;
+        int up   = 0;
+        for (int dy = y - 1; dy >= 0           && board.Get(x, dy) == type; dy--) down++;
+        for (int dy = y + 1; dy < board.Height  && board.Get(x, dy) == type; dy++) up++;
+        int vertLen = down + up + 1;
+
+        return Math.Max(horizLen, vertLen);
     }
 }
