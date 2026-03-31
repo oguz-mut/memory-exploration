@@ -45,10 +45,10 @@ class IterativeSolver
         var best = moveScores[0];
         SolverMove bestFirstMove = MakeSolverMove(best.x, best.y, best.dir, best.score, 1);
 
-        // ── Depth 2: top 8 moves ──
+        // ── Depth 2: top 12 moves ──
         if (_timer.ElapsedMilliseconds < _timeBudgetMs)
         {
-            int top2 = Math.Min(8, moveScores.Count);
+            int top2 = Math.Min(12, moveScores.Count);
             int bestScore2 = best.score;
             SolverMove? bestFirstMove2 = null;
 
@@ -84,10 +84,10 @@ class IterativeSolver
             }
         }
 
-        // ── Depth 3: top 5 moves ──
+        // ── Depth 3: top 8 moves ──
         if (_timer.ElapsedMilliseconds < _timeBudgetMs)
         {
-            int top3 = Math.Min(5, moveScores.Count);
+            int top3 = Math.Min(8, moveScores.Count);
             int bestScore3 = bestFirstMove.ScoreAfter;
             SolverMove? bestFirstMove3 = null;
 
@@ -122,10 +122,10 @@ class IterativeSolver
             }
         }
 
-        // ── Depth 4: top 3 moves ──
+        // ── Depth 4: top 5 moves ──
         if (_timer.ElapsedMilliseconds < _timeBudgetMs)
         {
-            int top4 = Math.Min(3, moveScores.Count);
+            int top4 = Math.Min(5, moveScores.Count);
             int bestScore4 = bestFirstMove.ScoreAfter;
             SolverMove? bestFirstMove4 = null;
 
