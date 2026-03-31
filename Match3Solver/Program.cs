@@ -319,78 +319,6 @@ void OnNewGame(int sessionId, Match3Config config)
                     await Task.Delay(1000);
                     continue;
                 }
-
-                // Fast path: try to execute subsequent moves from simulation without re-solving
-                if (success)
-                {
-                    // Build simulation from the state we solved from, advance by the first move
-                    var simState = state.Clone();
-                    simState.MakeMove(firstMove.X, firstMove.Y, firstMove.Direction);
-
-                    // Try executing moves 2, 3, 4 from simulation without re-solving
-                    for (int fastIdx = 1; fastIdx < Math.Min(4, 50); fastIdx++)
-                    {
-                        if (gameCt.IsCancellationRequested) break;
-                        if (simState.IsGameOver) break;
-
-                        // Read actual board after last move settled
-                        var fastRead = QuickReadBoard(config);
-                        if (fastRead == null) break;
-                        var (actualPieces, actualRng, actualTurns, actualScore, actualTier, actualTurnsMade2, actualTotalMatched2, actualTierMatched2) = fastRead.Value;
-
-                        if (actualTurns <= 0) break;
-
-                        // Compare actual board to our simulation
-                        bool boardMatch = true;
-                        var simPieces = simState.Board.GetPiecesArray();
-                        if (simPieces.Length != actualPieces.Length) { boardMatch = false; }
-                        else
-                        {
-                            for (int j = 0; j < simPieces.Length; j++)
-                                if (simPieces[j] != actualPieces[j]) { boardMatch = false; break; }
-                        }
-
-                        if (!boardMatch)
-                        {
-                            Console.WriteLine($"[~] Fast path: board diverged after {fastIdx} fast moves — re-solving");
-                            break;
-                        }
-
-                        // Board matches! Find best move from simulated state
-                        var fastMoves = simState.Board.GetAllValidMoves();
-                        if (fastMoves.Count == 0) break;
-
-                        // Quick greedy: pick best move by score (no deep search — speed is the advantage)
-                        int bestFastScore = int.MinValue;
-                        (int x, int y, MoveDir dir) bestFastMove = fastMoves[0];
-                        bool bestFastExtra = false;
-                        foreach (var (fx, fy, fdir) in fastMoves)
-                        {
-                            var probe = simState.Clone();
-                            probe.MakeMove(fx, fy, fdir);
-                            int s = probe.Score;
-                            if (probe.IsExtraTurnEarned) s += 1000; // heavily prefer free turns
-                            if (s > bestFastScore) { bestFastScore = s; bestFastMove = (fx, fy, fdir); bestFastExtra = probe.IsExtraTurnEarned; }
-                        }
-
-                        var fastSolverMove = new SolverMove { X = bestFastMove.x, Y = bestFastMove.y, Direction = bestFastMove.dir, ScoreAfter = bestFastScore };
-
-                        Console.WriteLine($"[>>] Fast move {fastIdx}: ({bestFastMove.x},{bestFastMove.y}) {bestFastMove.dir} (greedy, {(bestFastExtra ? "FREE" : "paid")})");
-
-                        bool fastSuccess = await GameAutoPlayer.ExecuteSingleMove(fastSolverMove, config, () =>
-                        {
-                            var r = QuickReadBoard(config);
-                            return r.HasValue ? (r.Value.pieces, r.Value.rng) : ((int[], MonoRandom)?)null;
-                        }, _gridX, _gridY, _cellSize, actualPieces);
-
-                        if (!fastSuccess) break;
-
-                        // Advance simulation
-                        simState.MakeMove(bestFastMove.x, bestFastMove.y, bestFastMove.dir);
-                        lastPredictedFirstMoveScore = simState.Score;
-                    }
-                }
-                // Continue to next iteration of the main loop (re-read + re-solve)
             }
 
             Console.WriteLine("[+] Auto-play complete");
@@ -1285,15 +1213,6 @@ class SimBoard
     }
 
     public int[] ClonePieces() => (int[])_pieces.Clone();
-
-    public int[] GetPiecesArray()
-    {
-        var result = new int[Width * Height];
-        for (int y = 0; y < Height; y++)
-            for (int x = 0; x < Width; x++)
-                result[y * Width + x] = Get(x, y);
-        return result;
-    }
 
     public SimBoard Clone() => new(Width, Height, NumPieceTypes, ActivePieceTypes, _pieces, _rng, _pieceTiers);
 
