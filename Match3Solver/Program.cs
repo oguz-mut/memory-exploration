@@ -636,63 +636,87 @@ ProcessMemory? EnsureGameConnection()
         // Read PRNG state FIRST — before pieces and game state — so we capture the
         // state that will generate the NEXT cascade fill, not one already advanced by
         // a concurrent cascade fill happening between our reads.
-        MonoRandom rng;
+        MonoRandom rng = new MonoRandom(config.RandomSeed);
         bool rngReadOk = false;
-        if (_lastGameStateAddr != 0)
-        {
-            try
-            {
-                ulong rndPtr = rptr(_lastGameStateAddr + 0x38);
-                int inext = ri32(rndPtr + 0x10);
-                int inextp = ri32(rndPtr + 0x14);
-                ulong seedArrayPtr = rptr(rndPtr + 0x18);
-                long seedArrayLen = ri64(seedArrayPtr + 0x18);
+        int expectedLen = config.Width * config.Height;
+        int[] pieces = new int[expectedLen];
 
-                if (seedArrayLen == 56 && inext >= 0 && inext < 56 && inextp >= 0 && inextp < 56)
-                {
-                    var seedArray = new int[56];
-                    for (int i = 0; i < 56; i++)
-                        seedArray[i] = ri32(seedArrayPtr + 0x20 + (ulong)(i * 4));
-                    rng = new MonoRandom(seedArray, inext, inextp);
-                    rngReadOk = true;
-                    Console.WriteLine($"[prng] inext={inext} inextp={inextp}");
-                }
-                else
-                {
-                    rng = new MonoRandom(config.RandomSeed);
-                }
-            }
-            catch
-            {
-                rng = new MonoRandom(config.RandomSeed);
-            }
-        }
-        else
+        for (int attempt = 0; attempt < 3; attempt++)
         {
-            rng = new MonoRandom(config.RandomSeed);
+            // Step 1: Read PRNG state
+            int inext0 = -1, inextp0 = -1;
+            MonoRandom? attemptRng = null;
+            if (_lastGameStateAddr != 0)
+            {
+                try
+                {
+                    ulong rndPtr = rptr(_lastGameStateAddr + 0x38);
+                    inext0 = ri32(rndPtr + 0x10);
+                    inextp0 = ri32(rndPtr + 0x14);
+                    ulong seedArrayPtr = rptr(rndPtr + 0x18);
+                    long seedArrayLen = ri64(seedArrayPtr + 0x18);
+
+                    if (seedArrayLen == 56 && inext0 >= 0 && inext0 < 56 && inextp0 >= 0 && inextp0 < 56)
+                    {
+                        var seedArray = new int[56];
+                        for (int i = 0; i < 56; i++)
+                            seedArray[i] = ri32(seedArrayPtr + 0x20 + (ulong)(i * 4));
+                        attemptRng = new MonoRandom(seedArray, inext0, inextp0);
+                    }
+                }
+                catch { }
+            }
+
+            // Step 2: Read pieces array
+            ulong piecesArrayPtr = rptr(_lastBoardAddr + 0x28);
+            long arrayLength = ri64(piecesArrayPtr + 0x18);
+            if (arrayLength != expectedLen) return null;
+
+            var attemptPieces = new int[expectedLen];
+            for (int i = 0; i < expectedLen; i++)
+            {
+                ulong piecePtr = rptr(piecesArrayPtr + 0x20 + (ulong)(i * 8));
+                if (piecePtr == 0) { attemptPieces[i] = -1; continue; }
+                int pieceType = ri32(piecePtr + 0x10);
+                int px = ri32(piecePtr + 0x14);
+                int py = ri32(piecePtr + 0x18);
+                if (pieceType < -1 || pieceType > 9 || px < 0 || px >= config.Width || py < 0 || py >= config.Height)
+                    return null;
+                attemptPieces[py * config.Width + px] = pieceType;
+            }
+
+            // Step 3: Re-read inext/inextp to detect PRNG drift during pieces read
+            bool drifted = false;
+            if (attemptRng != null && _lastGameStateAddr != 0)
+            {
+                try
+                {
+                    ulong rndPtr = rptr(_lastGameStateAddr + 0x38);
+                    int inext1 = ri32(rndPtr + 0x10);
+                    int inextp1 = ri32(rndPtr + 0x14);
+                    if (inext1 != inext0 || inextp1 != inextp0)
+                    {
+                        Console.WriteLine($"[!] PRNG drift detected (inext: {inext0}->{inext1}), retrying...");
+                        drifted = true;
+                    }
+                }
+                catch { }
+            }
+
+            // Commit this attempt's results (best effort even if drifted on last retry)
+            pieces = attemptPieces;
+            if (attemptRng != null)
+            {
+                rng = attemptRng;
+                rngReadOk = true;
+                Console.WriteLine($"[prng] inext={inext0} inextp={inextp0}");
+            }
+
+            if (!drifted) break;
         }
 
         if (!rngReadOk)
             Console.WriteLine("[!] QuickReadBoard: falling back to seed-based PRNG — cascade predictions may diverge");
-
-        // Read pieces array after PRNG so PRNG snapshot precedes any cascade fill
-        ulong piecesArrayPtr = rptr(_lastBoardAddr + 0x28);
-        long arrayLength = ri64(piecesArrayPtr + 0x18);
-        int expectedLen = config.Width * config.Height;
-        if (arrayLength != expectedLen) return null;
-
-        var pieces = new int[expectedLen];
-        for (int i = 0; i < expectedLen; i++)
-        {
-            ulong piecePtr = rptr(piecesArrayPtr + 0x20 + (ulong)(i * 8));
-            if (piecePtr == 0) { pieces[i] = -1; continue; }
-            int pieceType = ri32(piecePtr + 0x10);
-            int px = ri32(piecePtr + 0x14);
-            int py = ri32(piecePtr + 0x18);
-            if (pieceType < -1 || pieceType > 9 || px < 0 || px >= config.Width || py < 0 || py >= config.Height)
-                return null;
-            pieces[py * config.Width + px] = pieceType;
-        }
 
         // Read live game state from GameStateSinglePlayer
         int turnsRemaining = config.NumTurns;
