@@ -31,6 +31,7 @@ MemoryRegionScanner? _memScanner = null;
 ulong _lastBoardAddr = 0; // cached GameBoard address for fast re-reads
 ulong _lastGameStateAddr = 0; // cached GameStateSinglePlayer address
 CancellationTokenSource? _gameCts = null; // per-game CTS to cancel stale solve-move tasks
+SolverStrategy _strategy = SolverStrategy.Auto;
 
 // Grid calibration (at 1920x1080 base resolution)
 int _gridX = 35, _gridY = 245, _cellSize = 46;
@@ -184,7 +185,6 @@ void OnNewGame(int sessionId, Match3Config config)
                 var state = new SimGameState();
                 state.StartFromMemoryWithTurns(config, curPieces, curRng, turnsLeft, curScore, curTier, curTurnsMade, curTotalMatched, curTierMatched);
 
-                var solver = new Match3Solver();
                 var solveConfig = new Match3Config
                 {
                     Width = config.Width, Height = config.Height, Title = config.Title,
@@ -194,7 +194,44 @@ void OnNewGame(int sessionId, Match3Config config)
                     ScoreDeltasPerTier = config.ScoreDeltasPerTier, ScoresPerChainLevel = config.ScoresPerChainLevel,
                     Pieces = config.Pieces
                 };
-                var result = solver.Solve(state, solveConfig);
+
+                SolverResult result;
+                string stratLabel;
+                if (_strategy == SolverStrategy.Auto)
+                {
+                    // Auto: use MCTS for low turns (≤4), Iterative for medium (5-12), Beam for many (13+)
+                    if (turnsLeft <= 4)
+                    {
+                        var mcts = new MCTSSolver();
+                        result = mcts.Solve(state, solveConfig, 5000); // more time for few turns
+                        stratLabel = "mcts";
+                    }
+                    else if (turnsLeft <= 12)
+                    {
+                        var iter = new IterativeSolver();
+                        result = iter.Solve(state, solveConfig, 3000);
+                        stratLabel = "iterative";
+                    }
+                    else
+                    {
+                        var solver = new Match3Solver();
+                        result = solver.Solve(state, solveConfig);
+                        stratLabel = "beam";
+                    }
+                }
+                else
+                {
+                    // Explicit strategy
+                    result = _strategy switch
+                    {
+                        SolverStrategy.MCTS => new MCTSSolver().Solve(state, solveConfig),
+                        SolverStrategy.Eval => new EvalSolver().Solve(state, solveConfig),
+                        SolverStrategy.Iterative => new IterativeSolver().Solve(state, solveConfig),
+                        _ => new Match3Solver().Solve(state, solveConfig) // Beam
+                    };
+                    stratLabel = _strategy.ToString().ToLower();
+                }
+
                 sw.Stop();
                 result.SolveTime = sw.Elapsed;
                 session.Solution = result;
@@ -206,7 +243,7 @@ void OnNewGame(int sessionId, Match3Config config)
                     break;
                 }
 
-                Console.WriteLine($"[+] {turnsLeft} turns left: solved in {sw.ElapsedMilliseconds}ms — best score: {result.PredictedScore} ({result.BestMoves.Count} moves, {result.StatesExplored} states)");
+                Console.WriteLine($"[+] {turnsLeft} turns left [{stratLabel}]: solved in {sw.ElapsedMilliseconds}ms — best score: {result.PredictedScore} ({result.BestMoves.Count} moves, {result.StatesExplored} states)");
 
                 // Track the score predicted for after this move for divergence detection next iteration
                 lastPredictedFirstMoveScore = result.BestMoves[0].ScoreAfter;
@@ -892,6 +929,18 @@ if (!File.Exists(Path.Combine(settingsDir, "match3_grid.json")))
 }
 
 
+// Parse strategy from args
+foreach (var arg in args)
+{
+    if (arg.StartsWith("--strategy="))
+    {
+        var val = arg.Substring("--strategy=".Length);
+        if (Enum.TryParse<SolverStrategy>(val, true, out var s)) _strategy = s;
+        else Console.WriteLine($"[!] Unknown strategy: {val}. Using Auto.");
+    }
+}
+Console.WriteLine($"[*] Solver strategy: {_strategy}");
+
 var logTask = Task.Run(() => TailLog(cts.Token));
 var httpTask = Task.Run(() => RunHttpServer(cts.Token));
 await Task.WhenAll(logTask, httpTask);
@@ -904,6 +953,7 @@ enum MoveDir { Up = 0, Down = 1, Left = 2, Right = 3 }
 enum MoveResult { Success = 0, InvalidPosition, NoMatch, OtherError }
 enum MatchDirection { Horizontal = 0, Vertical = 1 }
 enum SolveStatus { Solving, Solved, Error }
+enum SolverStrategy { Auto, Beam, MCTS, Eval, Iterative }
 
 readonly record struct XY(int X, int Y);
 
