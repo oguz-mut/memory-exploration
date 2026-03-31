@@ -199,24 +199,20 @@ void OnNewGame(int sessionId, Match3Config config)
                 string stratLabel;
                 if (_strategy == SolverStrategy.Auto)
                 {
-                    // Auto: use MCTS for low turns (≤4), Iterative for medium (5-12), Beam for many (13+)
+                    // Auto: use MCTS for low turns (≤4), Iterative for everything else.
+                    // Beam search plans 15 turns ahead assuming perfect PRNG — fiction in practice.
+                    // Iterative with move ordering finds better first moves and respects PRNG reality.
                     if (turnsLeft <= 4)
                     {
                         var mcts = new MCTSSolver();
                         result = mcts.Solve(state, solveConfig, 5000); // more time for few turns
                         stratLabel = "mcts";
                     }
-                    else if (turnsLeft <= 12)
-                    {
-                        var iter = new IterativeSolver();
-                        result = iter.Solve(state, solveConfig, 3000);
-                        stratLabel = "iterative";
-                    }
                     else
                     {
-                        var solver = new Match3Solver();
-                        result = solver.Solve(state, solveConfig);
-                        stratLabel = "beam";
+                        var iter = new IterativeSolver();
+                        result = iter.Solve(state, solveConfig, 5000);
+                        stratLabel = "iterative";
                     }
                 }
                 else
