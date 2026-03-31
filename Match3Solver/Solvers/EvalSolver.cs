@@ -3,7 +3,7 @@ using System.Diagnostics;
 class EvalSolver
 {
     private int _statesExplored;
-    private const int SearchDepth = 3;
+    private const int SearchDepth = 5;
 
     public SolverResult Solve(SimGameState state, Match3Config config, int timeBudgetMs = 3000)
     {
@@ -181,16 +181,8 @@ class EvalSolver
             }
             else
             {
-                // Chance node: average over N random board fills (clones diverge via their own PRNG)
-                const int Samples = 5;
-                double totalValue = 0.0;
-                for (int s = 0; s < Samples; s++)
-                {
-                    if (sw.ElapsedMilliseconds >= timeBudgetMs) break;
-                    var sampleClone = clone.Clone();
-                    totalValue += Expectimax(sampleClone, depth - 1, config, sw, timeBudgetMs);
-                }
-                value = totalValue / Samples;
+                // Recurse directly — PRNG is deterministic so sampling identical clones is wasteful
+                value = Expectimax(clone, depth - 1, config, sw, timeBudgetMs);
             }
 
             if (value > bestValue)
