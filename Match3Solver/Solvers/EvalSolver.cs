@@ -3,7 +3,7 @@ using System.Diagnostics;
 class EvalSolver
 {
     private int _statesExplored;
-    private const int SearchDepth = 5;
+    private const int SearchDepth = 4;
 
     public SolverResult Solve(SimGameState state, Match3Config config, int timeBudgetMs = 3000)
     {
@@ -173,17 +173,7 @@ class EvalSolver
             clone.MakeMove(x, y, dir);
             _statesExplored++;
 
-            double value;
-            if (depth == 1)
-            {
-                // Leaf: evaluate directly
-                value = EvaluateBoard(clone, config);
-            }
-            else
-            {
-                // Recurse directly — PRNG is deterministic so sampling identical clones is wasteful
-                value = Expectimax(clone, depth - 1, config, sw, timeBudgetMs);
-            }
+            double value = Expectimax(clone, depth - 1, config, sw, timeBudgetMs);
 
             if (value > bestValue)
                 bestValue = value;
