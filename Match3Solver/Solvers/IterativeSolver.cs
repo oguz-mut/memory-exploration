@@ -63,7 +63,7 @@ class IterativeSolver
 
                 // Extra turn on first move: extend branch by 1, consume 1 extension slot
                 int remaining = clone1.IsExtraTurnEarned ? 2 : 1;
-                int extensions = clone1.IsExtraTurnEarned ? 1 : 2;
+                int extensions = 2;
 
                 int score = SearchBranch(clone1, remaining, extensions);
                 if (score > bestScore2)
@@ -101,7 +101,7 @@ class IterativeSolver
                 _statesExplored++;
 
                 int remaining = clone1.IsExtraTurnEarned ? 3 : 2;
-                int extensions = clone1.IsExtraTurnEarned ? 1 : 2;
+                int extensions = 2;
 
                 int score = SearchBranch(clone1, remaining, extensions);
                 if (score > bestScore3)
@@ -139,7 +139,7 @@ class IterativeSolver
                 _statesExplored++;
 
                 int remaining = clone1.IsExtraTurnEarned ? 4 : 3;
-                int extensions = clone1.IsExtraTurnEarned ? 1 : 2;
+                int extensions = 2;
 
                 int score = SearchBranch(clone1, remaining, extensions);
                 if (score > bestScore4)
@@ -182,6 +182,26 @@ class IterativeSolver
 
         var moves = state.Board.GetAllValidMoves();
         if (moves.Count == 0) return state.Score;
+
+        // Order moves at non-leaf levels: extra-turn moves first, then by score desc
+        if (remainingDepth > 1)
+        {
+            var ordered = new List<(int x, int y, MoveDir dir, int score, bool extraTurn)>(moves.Count);
+            foreach (var (x, y, dir) in moves)
+            {
+                if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
+                var probe = state.Clone();
+                probe.MakeMove(x, y, dir);
+                _statesExplored++;
+                ordered.Add((x, y, dir, probe.Score, probe.IsExtraTurnEarned));
+            }
+            ordered.Sort((a, b) =>
+            {
+                if (a.extraTurn != b.extraTurn) return b.extraTurn.CompareTo(a.extraTurn);
+                return b.score.CompareTo(a.score);
+            });
+            moves = ordered.Select(o => (o.x, o.y, o.dir)).ToList();
+        }
 
         int bestScore = state.Score;
         foreach (var (x, y, dir) in moves)
