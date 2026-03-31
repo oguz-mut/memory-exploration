@@ -1836,8 +1836,8 @@ static class GameAutoPlayer
 
     static async Task<(int[] pieces, MonoRandom rng)?> WaitForBoardSettle(
         Func<(int[] pieces, MonoRandom rng)?> readBoard,
-        int initialDelayMs = 2000,
-        int pollIntervalMs = 300,
+        int initialDelayMs = 1200,
+        int pollIntervalMs = 200,
         int timeoutMs = 8000)
     {
         await Task.Delay(initialDelayMs);
