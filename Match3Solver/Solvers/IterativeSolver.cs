@@ -18,7 +18,7 @@ class IterativeSolver
             return new SolverResult
             {
                 BestMoves = new List<SolverMove>(),
-                PredictedScore = state.Score,
+                PredictedScore = state.CascadeScore,
                 StatesExplored = 0,
                 Strategy = "IterativeSolver (no moves available)"
             };
@@ -31,7 +31,7 @@ class IterativeSolver
             var clone = state.Clone();
             clone.MakeMove(x, y, dir);
             _statesExplored++;
-            moveScores.Add((x, y, dir, clone.Score, clone.IsExtraTurnEarned));
+            moveScores.Add((x, y, dir, clone.CascadeScore, clone.IsExtraTurnEarned));
         }
 
         // Sort: extra-turn moves first, then by score descending
@@ -178,10 +178,10 @@ class IterativeSolver
     private int SearchBranch(SimGameState state, int remainingDepth, int extraExtensionsLeft)
     {
         if (remainingDepth == 0 || _timer.ElapsedMilliseconds >= _timeBudgetMs)
-            return state.Score + EstimateTierBonus(state);
+            return state.CascadeScore;
 
         var moves = state.Board.GetAllValidMoves();
-        if (moves.Count == 0) return state.Score;
+        if (moves.Count == 0) return state.CascadeScore;
 
         // Order moves at non-leaf levels: extra-turn moves first, then by score desc
         if (remainingDepth > 1)
@@ -193,7 +193,7 @@ class IterativeSolver
                 var probe = state.Clone();
                 probe.MakeMove(x, y, dir);
                 _statesExplored++;
-                ordered.Add((x, y, dir, probe.Score, probe.IsExtraTurnEarned));
+                ordered.Add((x, y, dir, probe.CascadeScore, probe.IsExtraTurnEarned));
             }
             ordered.Sort((a, b) =>
             {
@@ -203,7 +203,7 @@ class IterativeSolver
             moves = ordered.Select(o => (o.x, o.y, o.dir)).ToList();
         }
 
-        int bestScore = state.Score;
+        int bestScore = state.CascadeScore;
         foreach (var (x, y, dir) in moves)
         {
             if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
@@ -229,22 +229,6 @@ class IterativeSolver
             if (score > bestScore) bestScore = score;
         }
         return bestScore;
-    }
-
-    private static int EstimateTierBonus(SimGameState state)
-    {
-        // Bonus for being close to tier-up. Each piece type that has met
-        // the tier threshold contributes. If 4 out of 5 types are done,
-        // bonus is high (one more match away from tier-up).
-        if (state.TierPiecesMatched.Length == 0) return 0;
-        int activePieces = state.Board.ActivePieceTypes;
-        if (activePieces == 0) return 0;
-        int tieredCount = 0;
-        for (int i = 0; i < activePieces && i < state.PiecesTiered.Length; i++)
-            if (state.PiecesTiered[i]) tieredCount++;
-        // Scale: 0 tiered = 0 bonus, all-1 tiered = 50 bonus (one type away from tier-up)
-        // This is a gentle nudge, not overwhelming vs actual score differences
-        return tieredCount * 50 / activePieces;
     }
 
     private static SolverMove MakeSolverMove(int x, int y, MoveDir dir, int scoreAfter, int depth) =>

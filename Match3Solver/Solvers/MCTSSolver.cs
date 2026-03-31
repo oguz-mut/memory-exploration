@@ -53,7 +53,9 @@ class MCTSSolver
         var playoutCount        = new int[n];
         var postMoveStates      = new SimGameState[n];
 
-        int extraTurnBonus = config.ScoreFor4s * BONUS_MULTI;
+        int extraTurnBonus  = config.ScoreFor4s * BONUS_MULTI;
+        int tierUpBonus     = config.ScoreFor5s * 10;
+        int[] pieceReqsPerTier = config.PieceReqsPerTier;
 
         // ─────────────────────────────────────────────────────────────
         // Phase 1: exact cascade for every candidate move (real PRNG)
@@ -85,7 +87,7 @@ class MCTSSolver
 
             for (int p = 0; p < 3; p++)
             {
-                totalPlayoutScore[i] += RunPlayout(postMoveStates[i], warmupRng, extraTurnBonus);
+                totalPlayoutScore[i] += RunPlayout(postMoveStates[i], warmupRng, extraTurnBonus, tierUpBonus, pieceReqsPerTier);
                 playoutCount[i]++;
                 totalPlayoutsShared++;
             }
@@ -146,7 +148,7 @@ class MCTSSolver
 
                     // Clone is independent — no shared mutation
                     var playoutState = postMoveStates[pick].Clone();
-                    int score = RunPlayout(playoutState, rng, extraTurnBonus);
+                    int score = RunPlayout(playoutState, rng, extraTurnBonus, tierUpBonus, pieceReqsPerTier);
 
                     Interlocked.Add(ref totalPlayoutScore[pick], score);
                     Interlocked.Increment(ref playoutCount[pick]);
@@ -231,7 +233,7 @@ class MCTSSolver
     /// piece would create in each axis — O(board_dim) per move, no clone needed.
     /// 4+ length moves get a x5 bonus (extra-turn value).
     /// </summary>
-    private static int RunPlayout(SimGameState startState, Random rng, int extraTurnBonus)
+    private static int RunPlayout(SimGameState startState, Random rng, int extraTurnBonus, int tierUpBonus, int[] pieceReqsPerTier)
     {
         var playout       = startState.Clone();
         int extraTurnCount = 0;
@@ -248,7 +250,7 @@ class MCTSSolver
             }
             else
             {
-                chosen = PickPlayoutMove(playout, moves, rng, extraTurnBonus);
+                chosen = PickPlayoutMove(playout, moves, rng, extraTurnBonus, tierUpBonus, pieceReqsPerTier);
             }
 
             playout.MakeMove(chosen.x, chosen.y, chosen.dir);
@@ -270,7 +272,9 @@ class MCTSSolver
         SimGameState playout,
         List<(int x, int y, MoveDir dir)> moves,
         Random rng,
-        int extraTurnBonus)
+        int extraTurnBonus,
+        int tierUpBonus,
+        int[] pieceReqsPerTier)
     {
         int sampleSize = Math.Min(8, moves.Count);
         int bestIdx = 0;
@@ -283,15 +287,50 @@ class MCTSSolver
             (moves[i], moves[j]) = (moves[j], moves[i]);
         }
 
-        int baseLine = playout.Score;
+        int baseLine    = playout.Score;
+        int currentTier = playout.Tier;
+
+        // Extra turns are more valuable when turns are scarce
+        int effectiveExtraTurnBonus = playout.TurnsRemaining <= 3
+            ? extraTurnBonus * 2
+            : extraTurnBonus;
+
         for (int i = 0; i < sampleSize; i++)
         {
             var (mx, my, mdir) = moves[i];
             var clone = playout.Clone();
             clone.MakeMove(mx, my, mdir);
             int score = clone.Score - baseLine;
+
             if (clone.IsExtraTurnEarned)
-                score += extraTurnBonus;
+                score += effectiveExtraTurnBonus;
+
+            // Tier-progress weighting
+            if (clone.Tier > currentTier)
+            {
+                // Tier-up achieved — large bonus reflecting unlocked items and score burst
+                score += tierUpBonus;
+            }
+            else if (pieceReqsPerTier != null && currentTier < pieceReqsPerTier.Length)
+            {
+                int req = pieceReqsPerTier[currentTier];
+                if (req > 0)
+                {
+                    // Sum piece-type progress made by this move
+                    int progressDelta = 0;
+                    int activePieces  = playout.Board.ActivePieceTypes;
+                    for (int p = 0; p < activePieces
+                                 && p < clone.TierPiecesMatched.Length
+                                 && p < playout.TierPiecesMatched.Length; p++)
+                    {
+                        progressDelta += clone.TierPiecesMatched[p] - playout.TierPiecesMatched[p];
+                    }
+
+                    if (progressDelta > 0)
+                        score += (tierUpBonus / req) * progressDelta;
+                }
+            }
+
             if (score > bestScore)
             {
                 bestScore = score;
