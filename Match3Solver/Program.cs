@@ -210,9 +210,24 @@ void OnNewGame(int sessionId, Match3Config config)
                     }
                     else
                     {
-                        var iter = new IterativeSolver();
-                        result = iter.Solve(state, solveConfig, 5000);
-                        stratLabel = "iterative";
+                        // Cross-solver validation: run Iterative + MCTS in parallel, pick the higher score.
+                        // Each gets 4s instead of 5s since they share CPU; wall-clock stays ~4s.
+                        var iterTask = Task.Run(() => new IterativeSolver().Solve(state, solveConfig, 4000));
+                        var mctsTask = Task.Run(() => new MCTSSolver().Solve(state, solveConfig, 4000));
+                        Task.WaitAll(iterTask, mctsTask);
+                        var iterResult = iterTask.Result;
+                        var mctsResult = mctsTask.Result;
+                        Console.WriteLine($"[~] cross-validate: iterative={iterResult.PredictedScore} mcts={mctsResult.PredictedScore}");
+                        if (mctsResult.PredictedScore > iterResult.PredictedScore && mctsResult.BestMoves.Count > 0)
+                        {
+                            result = mctsResult;
+                            stratLabel = "mcts(cross)";
+                        }
+                        else
+                        {
+                            result = iterResult;
+                            stratLabel = "iterative(cross)";
+                        }
                     }
                 }
                 else
