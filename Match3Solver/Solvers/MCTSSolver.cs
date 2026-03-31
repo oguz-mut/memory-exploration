@@ -6,7 +6,7 @@ using System.Diagnostics;
 //              selection, and adaptive time allocation
 // ═══════════════════════════════════════════════════════════════════
 
-class MCTSSolver
+class MCTSSolver : ISolver
 {
     private const double UCB1_C      = 1.41;        // exploration constant sqrt(2)
     private const double EPSILON     = 0.15;        // fraction of random (exploration) playout moves

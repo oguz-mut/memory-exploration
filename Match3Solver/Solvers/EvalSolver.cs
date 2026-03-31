@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-class EvalSolver
+class EvalSolver : ISolver
 {
     private int _statesExplored;
     private const int SearchDepth = 4;

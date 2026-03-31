@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-class IterativeSolver
+class IterativeSolver : ISolver
 {
     private int _statesExplored;
     private Stopwatch _timer = new();
