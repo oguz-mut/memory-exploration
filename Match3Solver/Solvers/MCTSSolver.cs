@@ -224,7 +224,7 @@ class MCTSSolver
             }
             else
             {
-                chosen = PickPlayoutMove(playout.Board, moves, rng);
+                chosen = PickPlayoutMove(playout, moves, rng, extraTurnBonus);
             }
 
             playout.MakeMove(chosen.x, chosen.y, chosen.dir);
@@ -237,69 +237,44 @@ class MCTSSolver
     }
 
     /// <summary>
-    /// Score each move by the run length the swapped pieces would form, then
-    /// return the move with the highest score.  No board clone required — the
-    /// heuristic inspects neighbors without mutating the board.
-    /// 4+ length bonus: multiply score by BONUS_MULTI (extra-turn value).
+    /// Clone-based greedy: sample up to 5 random candidates, simulate each with
+    /// full cascade via Clone()+MakeMove(), pick the one with highest score delta.
+    /// Extra turns get a bonus multiplier. More expensive per call than a heuristic,
+    /// but each playout plays realistically — quality over quantity.
     /// </summary>
     private static (int x, int y, MoveDir dir) PickPlayoutMove(
-        SimBoard board,
+        SimGameState playout,
         List<(int x, int y, MoveDir dir)> moves,
-        Random rng)
+        Random rng,
+        int extraTurnBonus)
     {
-        int bestMoveIdx = 0;
-        int bestScore   = -1;
+        int sampleSize = Math.Min(5, moves.Count);
+        int bestIdx = 0;
+        int bestScore = int.MinValue;
 
-        for (int i = 0; i < moves.Count; i++)
+        // Fisher-Yates partial shuffle to get sampleSize random candidates
+        for (int i = 0; i < sampleSize; i++)
+        {
+            int j = rng.Next(i, moves.Count);
+            (moves[i], moves[j]) = (moves[j], moves[i]);
+        }
+
+        int baseLine = playout.Score;
+        for (int i = 0; i < sampleSize; i++)
         {
             var (mx, my, mdir) = moves[i];
-            var target = SimBoard.DeltaByDir(mx, my, mdir);
-
-            int type1 = board.Get(mx, my);
-            int type2 = board.Get(target.X, target.Y);
-
-            // Run length for piece1 landing at target position
-            int run1 = CountRunLength(board, target.X, target.Y, type1);
-            // Run length for piece2 landing at source position
-            int run2 = CountRunLength(board, mx, my, type2);
-
-            int score = run1 + run2;
-
-            // Bonus for 4+ match (grants an extra turn)
-            if (run1 >= 4 || run2 >= 4)
-                score *= BONUS_MULTI;
-
+            var clone = playout.Clone();
+            clone.MakeMove(mx, my, mdir);
+            int score = clone.Score - baseLine;
+            if (clone.IsExtraTurnEarned)
+                score += extraTurnBonus;
             if (score > bestScore)
             {
-                bestScore   = score;
-                bestMoveIdx = i;
+                bestScore = score;
+                bestIdx = i;
             }
         }
 
-        return moves[bestMoveIdx];
-    }
-
-    /// <summary>
-    /// Returns the maximum run length (horizontal or vertical) that a piece of
-    /// <paramref name="type"/> would form if placed at (x, y), treating the
-    /// current occupant as already replaced.  O(Width + Height).
-    /// </summary>
-    private static int CountRunLength(SimBoard board, int x, int y, int type)
-    {
-        // Horizontal run
-        int left  = 0;
-        int right = 0;
-        for (int dx = x - 1; dx >= 0          && board.Get(dx, y) == type; dx--) left++;
-        for (int dx = x + 1; dx < board.Width  && board.Get(dx, y) == type; dx++) right++;
-        int horizLen = left + right + 1;
-
-        // Vertical run
-        int down = 0;
-        int up   = 0;
-        for (int dy = y - 1; dy >= 0           && board.Get(x, dy) == type; dy--) down++;
-        for (int dy = y + 1; dy < board.Height  && board.Get(x, dy) == type; dy++) up++;
-        int vertLen = down + up + 1;
-
-        return Math.Max(horizLen, vertLen);
+        return moves[bestIdx];
     }
 }
