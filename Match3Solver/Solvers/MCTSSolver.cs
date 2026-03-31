@@ -9,8 +9,8 @@ using System.Diagnostics;
 class MCTSSolver
 {
     private const double UCB1_C      = 1.41;        // exploration constant sqrt(2)
-    private const double EPSILON     = 0.30;        // fraction of random (exploration) playout moves
-    private const int    BONUS_MULTI = 3;           // multiplier for moves creating 4+ matches
+    private const double EPSILON     = 0.15;        // fraction of random (exploration) playout moves
+    private const int    BONUS_MULTI = 5;           // multiplier for moves creating 4+ matches
 
     /// <summary>
     /// Solve using MCTS: exact first cascade (real PRNG clone), then UCB1-guided
@@ -53,7 +53,7 @@ class MCTSSolver
         var playoutCount        = new int[n];
         var postMoveStates      = new SimGameState[n];
 
-        int extraTurnBonus = config.ScoreFor4s * 2;
+        int extraTurnBonus = config.ScoreFor4s * BONUS_MULTI;
 
         // ─────────────────────────────────────────────────────────────
         // Phase 1: exact cascade for every candidate move (real PRNG)
@@ -226,10 +226,10 @@ class MCTSSolver
 
     /// <summary>
     /// Run a single playout to game over using:
-    ///   30 % random (epsilon), 70 % greedy by neighbor-count heuristic.
+    ///   15 % random (epsilon), 85 % greedy by neighbor-count heuristic.
     /// The heuristic scores each move by how long a run the swapped
     /// piece would create in each axis — O(board_dim) per move, no clone needed.
-    /// 4+ length moves get a x3 bonus (extra-turn value).
+    /// 4+ length moves get a x5 bonus (extra-turn value).
     /// </summary>
     private static int RunPlayout(SimGameState startState, Random rng, int extraTurnBonus)
     {
@@ -272,7 +272,7 @@ class MCTSSolver
         Random rng,
         int extraTurnBonus)
     {
-        int sampleSize = Math.Min(5, moves.Count);
+        int sampleSize = Math.Min(8, moves.Count);
         int bestIdx = 0;
         int bestScore = int.MinValue;
 
