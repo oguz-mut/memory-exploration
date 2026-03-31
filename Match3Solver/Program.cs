@@ -211,9 +211,15 @@ void OnNewGame(int sessionId, Match3Config config)
                     else
                     {
                         // Cross-solver validation: run Iterative + MCTS in parallel, pick the higher score.
-                        // Each gets 4s instead of 5s since they share CPU; wall-clock stays ~4s.
-                        var iterTask = Task.Run(() => new IterativeSolver().Solve(state, solveConfig, 4000));
-                        var mctsTask = Task.Run(() => new MCTSSolver().Solve(state, solveConfig, 4000));
+                        // Each solver gets the same budget; adaptive time favors early game (tier setup).
+                        int iterBudget = turnsLeft switch
+                        {
+                            >= 12 => 7000,  // early game: tier setup is critical
+                            >= 8  => 5000,  // mid game: standard budget
+                            _     => 4000,  // late game: diminishing returns
+                        };
+                        var iterTask = Task.Run(() => new IterativeSolver().Solve(state, solveConfig, iterBudget));
+                        var mctsTask = Task.Run(() => new MCTSSolver().Solve(state, solveConfig, iterBudget));
                         Task.WaitAll(iterTask, mctsTask);
                         var iterResult = iterTask.Result;
                         var mctsResult = mctsTask.Result;
