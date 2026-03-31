@@ -61,19 +61,15 @@ class IterativeSolver
                 clone1.MakeMove(mx, my, mdir);
                 _statesExplored++;
 
-                var secondMoves = clone1.Board.GetAllValidMoves();
-                foreach (var (sx, sy, sdir) in secondMoves)
-                {
-                    if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
-                    var clone2 = clone1.Clone();
-                    clone2.MakeMove(sx, sy, sdir);
-                    _statesExplored++;
+                // Extra turn on first move: extend branch by 1, consume 1 extension slot
+                int remaining = clone1.IsExtraTurnEarned ? 2 : 1;
+                int extensions = 2;
 
-                    if (clone2.Score > bestScore2)
-                    {
-                        bestScore2 = clone2.Score;
-                        bestFirstMove2 = MakeSolverMove(mx, my, mdir, clone2.Score, 2);
-                    }
+                int score = SearchBranch(clone1, remaining, extensions);
+                if (score > bestScore2)
+                {
+                    bestScore2 = score;
+                    bestFirstMove2 = MakeSolverMove(mx, my, mdir, score, 2);
                 }
             }
 
@@ -84,12 +80,11 @@ class IterativeSolver
             }
             else if (maxDepthReached < 2 && _timer.ElapsedMilliseconds < _timeBudgetMs)
             {
-                // Depth 2 completed but didn't beat depth 1 — still count it
                 maxDepthReached = 2;
             }
         }
 
-        // ── Depth 3: top 5 moves, 3-level deep ──
+        // ── Depth 3: top 5 moves ──
         if (_timer.ElapsedMilliseconds < _timeBudgetMs)
         {
             int top3 = Math.Min(5, moveScores.Count);
@@ -105,31 +100,14 @@ class IterativeSolver
                 clone1.MakeMove(mx, my, mdir);
                 _statesExplored++;
 
-                var secondMoves = clone1.Board.GetAllValidMoves();
-                // Order second moves: extra-turn first, then by score
-                var second2 = OrderMoves(clone1, secondMoves);
+                int remaining = clone1.IsExtraTurnEarned ? 3 : 2;
+                int extensions = 2;
 
-                foreach (var (sx, sy, sdir, _, _) in second2)
+                int score = SearchBranch(clone1, remaining, extensions);
+                if (score > bestScore3)
                 {
-                    if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
-                    var clone2 = clone1.Clone();
-                    clone2.MakeMove(sx, sy, sdir);
-                    _statesExplored++;
-
-                    var thirdMoves = clone2.Board.GetAllValidMoves();
-                    foreach (var (tx, ty, tdir) in thirdMoves)
-                    {
-                        if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
-                        var clone3 = clone2.Clone();
-                        clone3.MakeMove(tx, ty, tdir);
-                        _statesExplored++;
-
-                        if (clone3.Score > bestScore3)
-                        {
-                            bestScore3 = clone3.Score;
-                            bestFirstMove3 = MakeSolverMove(mx, my, mdir, clone3.Score, 3);
-                        }
-                    }
+                    bestScore3 = score;
+                    bestFirstMove3 = MakeSolverMove(mx, my, mdir, score, 3);
                 }
             }
 
@@ -144,7 +122,7 @@ class IterativeSolver
             }
         }
 
-        // ── Depth 4: top 3 moves, 4-level deep ──
+        // ── Depth 4: top 3 moves ──
         if (_timer.ElapsedMilliseconds < _timeBudgetMs)
         {
             int top4 = Math.Min(3, moveScores.Count);
@@ -160,41 +138,14 @@ class IterativeSolver
                 clone1.MakeMove(mx, my, mdir);
                 _statesExplored++;
 
-                var secondMoves = clone1.Board.GetAllValidMoves();
-                var second2 = OrderMoves(clone1, secondMoves);
+                int remaining = clone1.IsExtraTurnEarned ? 4 : 3;
+                int extensions = 2;
 
-                foreach (var (sx, sy, sdir, _, _) in second2)
+                int score = SearchBranch(clone1, remaining, extensions);
+                if (score > bestScore4)
                 {
-                    if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
-                    var clone2 = clone1.Clone();
-                    clone2.MakeMove(sx, sy, sdir);
-                    _statesExplored++;
-
-                    var thirdMoves = clone2.Board.GetAllValidMoves();
-                    var third2 = OrderMoves(clone2, thirdMoves);
-
-                    foreach (var (tx, ty, tdir, _, _) in third2)
-                    {
-                        if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
-                        var clone3 = clone2.Clone();
-                        clone3.MakeMove(tx, ty, tdir);
-                        _statesExplored++;
-
-                        var fourthMoves = clone3.Board.GetAllValidMoves();
-                        foreach (var (fx, fy, fdir) in fourthMoves)
-                        {
-                            if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
-                            var clone4 = clone3.Clone();
-                            clone4.MakeMove(fx, fy, fdir);
-                            _statesExplored++;
-
-                            if (clone4.Score > bestScore4)
-                            {
-                                bestScore4 = clone4.Score;
-                                bestFirstMove4 = MakeSolverMove(mx, my, mdir, clone4.Score, 4);
-                            }
-                        }
-                    }
+                    bestScore4 = score;
+                    bestFirstMove4 = MakeSolverMove(mx, my, mdir, score, 4);
                 }
             }
 
@@ -219,26 +170,65 @@ class IterativeSolver
     }
 
     /// <summary>
-    /// Orders a set of raw moves by evaluating each one on the given state:
-    /// extra-turn moves first, then by resulting score descending.
+    /// Recursively searches for the best score reachable within remainingDepth moves.
+    /// When a move earns an extra turn (IsExtraTurnEarned), the depth is not decremented —
+    /// the free turn is explored at the same remaining depth. Capped at extraExtensionsLeft
+    /// extra-turn extensions per path to prevent runaway searches.
     /// </summary>
-    private List<(int x, int y, MoveDir dir, int score, bool extraTurn)> OrderMoves(
-        SimGameState state, List<(int x, int y, MoveDir dir)> moves)
+    private int SearchBranch(SimGameState state, int remainingDepth, int extraExtensionsLeft)
     {
-        var scored = new List<(int x, int y, MoveDir dir, int score, bool extraTurn)>(moves.Count);
+        if (remainingDepth == 0 || _timer.ElapsedMilliseconds >= _timeBudgetMs)
+            return state.Score;
+
+        var moves = state.Board.GetAllValidMoves();
+        if (moves.Count == 0) return state.Score;
+
+        // Order moves at non-leaf levels: extra-turn moves first, then by score desc
+        if (remainingDepth > 1)
+        {
+            var ordered = new List<(int x, int y, MoveDir dir, int score, bool extraTurn)>(moves.Count);
+            foreach (var (x, y, dir) in moves)
+            {
+                if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
+                var probe = state.Clone();
+                probe.MakeMove(x, y, dir);
+                _statesExplored++;
+                ordered.Add((x, y, dir, probe.Score, probe.IsExtraTurnEarned));
+            }
+            ordered.Sort((a, b) =>
+            {
+                if (a.extraTurn != b.extraTurn) return b.extraTurn.CompareTo(a.extraTurn);
+                return b.score.CompareTo(a.score);
+            });
+            moves = ordered.Select(o => (o.x, o.y, o.dir)).ToList();
+        }
+
+        int bestScore = state.Score;
         foreach (var (x, y, dir) in moves)
         {
+            if (_timer.ElapsedMilliseconds >= _timeBudgetMs) break;
+
             var clone = state.Clone();
             clone.MakeMove(x, y, dir);
             _statesExplored++;
-            scored.Add((x, y, dir, clone.Score, clone.IsExtraTurnEarned));
+
+            int nextDepth;
+            int nextExtensions;
+            if (clone.IsExtraTurnEarned && extraExtensionsLeft > 0)
+            {
+                nextDepth = remainingDepth;           // free turn: don't consume depth
+                nextExtensions = extraExtensionsLeft - 1;
+            }
+            else
+            {
+                nextDepth = remainingDepth - 1;
+                nextExtensions = extraExtensionsLeft;
+            }
+
+            int score = SearchBranch(clone, nextDepth, nextExtensions);
+            if (score > bestScore) bestScore = score;
         }
-        scored.Sort((a, b) =>
-        {
-            if (a.extraTurn != b.extraTurn) return b.extraTurn.CompareTo(a.extraTurn);
-            return b.score.CompareTo(a.score);
-        });
-        return scored;
+        return bestScore;
     }
 
     private static SolverMove MakeSolverMove(int x, int y, MoveDir dir, int scoreAfter, int depth) =>
