@@ -22,21 +22,10 @@ if (!File.Exists(logPath))
 }
 
 // ── Shared State ──
-var _lock = new object();
-GameSession? _currentSession = null;
-var _history = new List<GameSession>();
 var cts = new CancellationTokenSource();
-ProcessMemory? _gameMemory = null;
+var gctx = new GameContext();
+ProcessMemory? _gameMemory = null;        // MemoryLib type — kept here to avoid ref from GameContext.cs
 MemoryRegionScanner? _memScanner = null;
-ulong _lastBoardAddr = 0; // cached GameBoard address for fast re-reads
-ulong _lastGameStateAddr = 0; // cached GameStateSinglePlayer address
-CancellationTokenSource? _gameCts = null; // per-game CTS to cancel stale solve-move tasks
-SolverStrategy _strategy = SolverStrategy.Auto;
-bool _autoloop = false;
-TaskCompletionSource<bool>? _newGameSignal = null; // signaled when a new ProcessMatch3Start arrives
-
-// Grid calibration (at 1920x1080 base resolution)
-int _gridX = 35, _gridY = 245, _cellSize = 46;
 string settingsDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
     "ProjectGorgonTools");
@@ -47,10 +36,10 @@ string settingsDir = Path.Combine(
         try
         {
             var doc = JsonDocument.Parse(File.ReadAllText(calFile));
-            if (doc.RootElement.TryGetProperty("gridX", out var gx)) _gridX = gx.GetInt32();
-            if (doc.RootElement.TryGetProperty("gridY", out var gy)) _gridY = gy.GetInt32();
-            if (doc.RootElement.TryGetProperty("cellSize", out var cs)) _cellSize = cs.GetInt32();
-            Console.WriteLine($"[*] Loaded grid calibration: gridX={_gridX}, gridY={_gridY}, cellSize={_cellSize}");
+            if (doc.RootElement.TryGetProperty("gridX", out var gx)) gctx.GridX = gx.GetInt32();
+            if (doc.RootElement.TryGetProperty("gridY", out var gy)) gctx.GridY = gy.GetInt32();
+            if (doc.RootElement.TryGetProperty("cellSize", out var cs)) gctx.CellSize = cs.GetInt32();
+            Console.WriteLine($"[*] Loaded grid calibration: gridX={gctx.GridX}, gridY={gctx.GridY}, cellSize={gctx.CellSize}");
         }
         catch { }
     }
@@ -149,7 +138,7 @@ void ProcessLogLine(string line)
 void OnNewGame(int sessionId, Match3Config config)
 {
     // Signal any waiting autoloop that a new game has started
-    _newGameSignal?.TrySetResult(true);
+    gctx.NewGameSignal?.TrySetResult(true);
 
     var session = new GameSession
     {
@@ -162,17 +151,17 @@ void OnNewGame(int sessionId, Match3Config config)
     };
 
     // Cancel any previously running solve-move task and clear cached addresses
-    _gameCts?.Cancel();
-    _gameCts = new CancellationTokenSource();
-    var gameCt = _gameCts.Token;
-    _lastBoardAddr = 0;
-    _lastGameStateAddr = 0;
+    gctx.GameCts?.Cancel();
+    gctx.GameCts = new CancellationTokenSource();
+    var gameCt = gctx.GameCts.Token;
+    gctx.LastBoardAddr = 0;
+    gctx.LastGameStateAddr = 0;
 
-    lock (_lock)
+    lock (gctx.Lock)
     {
-        if (_currentSession != null)
-            _history.Add(_currentSession);
-        _currentSession = session;
+        if (gctx.CurrentSession != null)
+            gctx.History.Add(gctx.CurrentSession);
+        gctx.CurrentSession = session;
     }
 
     Task.Run(async () =>
@@ -188,7 +177,7 @@ void OnNewGame(int sessionId, Match3Config config)
             session.Status = SolveStatus.Error;
             session.ErrorMessage = "Failed to read board from game memory (is the game running?)";
             Console.WriteLine("[!] Memory read failed");
-            if (_autoloop && !gameCt.IsCancellationRequested)
+            if (gctx.Autoloop && !gameCt.IsCancellationRequested)
             {
                 Console.WriteLine("[autoloop] Stale game — attempting to start a new one...");
                 await AutoStartNewGame(gameCt);
@@ -206,7 +195,7 @@ void OnNewGame(int sessionId, Match3Config config)
             if (earlyCheck != null && earlyCheck.Value.turnsRemaining <= 0)
             {
                 Console.WriteLine("[*] Game already over (stale) — skipping to autoloop");
-                if (_autoloop && !gameCt.IsCancellationRequested)
+                if (gctx.Autoloop && !gameCt.IsCancellationRequested)
                     await AutoStartNewGame(gameCt);
                 return;
             }
@@ -280,7 +269,7 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 SolverResult result;
                 string stratLabel;
-                if (_strategy == SolverStrategy.Auto)
+                if (gctx.Strategy == SolverStrategy.Auto)
                 {
                     // Auto: use MCTS for low turns (≤4), Iterative for everything else.
                     // Beam search plans 15 turns ahead assuming perfect PRNG — fiction in practice.
@@ -319,7 +308,7 @@ void OnNewGame(int sessionId, Match3Config config)
                 {
                     // Explicit strategy
                     int budgetMs = 3000;
-                    ISolver solver = _strategy switch
+                    ISolver solver = gctx.Strategy switch
                     {
                         SolverStrategy.MCTS      => (ISolver)new MCTSSolver(),
                         SolverStrategy.Eval      => new EvalSolver(),
@@ -332,7 +321,7 @@ void OnNewGame(int sessionId, Match3Config config)
                         ? await solveTask
                         : new SolverResult { BestMoves = new List<SolverMove>(), PredictedScore = 0, StatesExplored = 0, Strategy = "timeout" };
                     if (completed != solveTask) Console.WriteLine("[!] Solver hard timeout");
-                    stratLabel = _strategy.ToString().ToLower();
+                    stratLabel = gctx.Strategy.ToString().ToLower();
                 }
 
                 sw.Stop();
@@ -398,7 +387,7 @@ void OnNewGame(int sessionId, Match3Config config)
                 {
                     var r = QuickReadBoard(config);
                     return r.HasValue ? (r.Value.pieces, r.Value.rng) : ((int[], MonoRandom)?)null;
-                }, _gridX, _gridY, _cellSize, curPieces);
+                }, gctx.GridX, gctx.GridY, gctx.CellSize, curPieces);
 
                 if (success)
                 {
@@ -423,7 +412,7 @@ void OnNewGame(int sessionId, Match3Config config)
             Console.WriteLine("[+] Auto-play complete");
 
             // Autoloop: click through Game Over → Use machine → Play Game
-            if (_autoloop && !gameCt.IsCancellationRequested)
+            if (gctx.Autoloop && !gameCt.IsCancellationRequested)
             {
                 await AutoStartNewGame(gameCt);
             }
@@ -444,12 +433,6 @@ void OnNewGame(int sessionId, Match3Config config)
 
 // ── Autoloop: Start New Game ──
 
-// Autoloop click positions (loaded from/saved to settings)
-int _okClickX = 0, _okClickY = 0;
-int _useClickX = 0, _useClickY = 0;
-int _playClickX = 0, _playClickY = 0;
-bool _autoloopCalibrated = false;
-
 void LoadAutoloopCalibration()
 {
     var calFile = Path.Combine(settingsDir, "autoloop_clicks.json");
@@ -458,14 +441,14 @@ void LoadAutoloopCalibration()
         try
         {
             var doc = JsonDocument.Parse(File.ReadAllText(calFile));
-            _okClickX = doc.RootElement.GetProperty("okX").GetInt32();
-            _okClickY = doc.RootElement.GetProperty("okY").GetInt32();
-            _useClickX = doc.RootElement.GetProperty("useX").GetInt32();
-            _useClickY = doc.RootElement.GetProperty("useY").GetInt32();
-            _playClickX = doc.RootElement.GetProperty("playX").GetInt32();
+            gctx.OkClickX = doc.RootElement.GetProperty("okX").GetInt32();
+            gctx.OkClickY = doc.RootElement.GetProperty("okY").GetInt32();
+            gctx.UseClickX = doc.RootElement.GetProperty("useX").GetInt32();
+            gctx.UseClickY = doc.RootElement.GetProperty("useY").GetInt32();
+            gctx.PlayClickX = doc.RootElement.GetProperty("playX").GetInt32();
             _playClickY = doc.RootElement.GetProperty("playY").GetInt32();
-            _autoloopCalibrated = true;
-            Console.WriteLine($"[autoloop] Loaded click positions: OK=({_okClickX},{_okClickY}) Use=({_useClickX},{_useClickY}) Play=({_playClickX},{_playClickY})");
+            gctx.AutoloopCalibrated = true;
+            Console.WriteLine($"[autoloop] Loaded click positions: OK=({gctx.OkClickX},{gctx.OkClickY}) Use=({gctx.UseClickX},{gctx.UseClickY}) Play=({gctx.PlayClickX},{_playClickY})");
         }
         catch { }
     }
@@ -482,26 +465,26 @@ void CalibrateAutoloop()
     Console.WriteLine("Step 1: Click the OK button on the Game Over dialog.");
     Console.Write("  Waiting for your click... ");
     var ok = GameAutoPlayer.WaitForClick();
-    _okClickX = ok.X; _okClickY = ok.Y;
+    gctx.OkClickX = ok.X; gctx.OkClickY = ok.Y;
     Console.WriteLine($"OK at ({ok.X},{ok.Y})");
 
     Console.WriteLine("Step 2: Click the USE button on the machine nameplate.");
     Console.Write("  Waiting for your click... ");
     var use = GameAutoPlayer.WaitForClick();
-    _useClickX = use.X; _useClickY = use.Y;
+    gctx.UseClickX = use.X; gctx.UseClickY = use.Y;
     Console.WriteLine($"Use at ({use.X},{use.Y})");
 
     Console.WriteLine("Step 3: Click the PLAY GAME button on the dialog panel.");
     Console.Write("  Waiting for your click... ");
     var play = GameAutoPlayer.WaitForClick();
-    _playClickX = play.X; _playClickY = play.Y;
+    gctx.PlayClickX = play.X; _playClickY = play.Y;
     Console.WriteLine($"Play at ({play.X},{play.Y})");
 
-    _autoloopCalibrated = true;
+    gctx.AutoloopCalibrated = true;
 
     // Save
     Directory.CreateDirectory(settingsDir);
-    var json = $"{{\"okX\":{_okClickX},\"okY\":{_okClickY},\"useX\":{_useClickX},\"useY\":{_useClickY},\"playX\":{_playClickX},\"playY\":{_playClickY}}}";
+    var json = $"{{\"okX\":{gctx.OkClickX},\"okY\":{gctx.OkClickY},\"useX\":{gctx.UseClickX},\"useY\":{gctx.UseClickY},\"playX\":{gctx.PlayClickX},\"playY\":{_playClickY}}}";
     File.WriteAllText(Path.Combine(settingsDir, "autoloop_clicks.json"), json);
     Console.WriteLine("[autoloop] Calibration saved! Will reuse next time.");
     Console.WriteLine();
@@ -509,10 +492,10 @@ void CalibrateAutoloop()
 
 async Task AutoStartNewGame(CancellationToken ct)
 {
-    if (!_autoloopCalibrated)
+    if (!gctx.AutoloopCalibrated)
     {
         LoadAutoloopCalibration();
-        if (!_autoloopCalibrated)
+        if (!gctx.AutoloopCalibrated)
             CalibrateAutoloop();
     }
 
@@ -521,36 +504,36 @@ async Task AutoStartNewGame(CancellationToken ct)
     // Step 1: Click OK on Game Over
     GameAutoPlayer.FocusGameWindow();
     await Task.Delay(500);
-    Console.WriteLine($"[autoloop] Clicking OK at ({_okClickX},{_okClickY})");
-    GameAutoPlayer.ClickAt(_okClickX, _okClickY);
+    Console.WriteLine($"[autoloop] Clicking OK at ({gctx.OkClickX},{gctx.OkClickY})");
+    GameAutoPlayer.ClickAt(gctx.OkClickX, gctx.OkClickY);
     await Task.Delay(1500);
 
     // Step 2: Click Use on machine
-    Console.WriteLine($"[autoloop] Clicking Use at ({_useClickX},{_useClickY})");
-    GameAutoPlayer.ClickAt(_useClickX, _useClickY);
+    Console.WriteLine($"[autoloop] Clicking Use at ({gctx.UseClickX},{gctx.UseClickY})");
+    GameAutoPlayer.ClickAt(gctx.UseClickX, gctx.UseClickY);
     await Task.Delay(2000);
 
     // Step 3: Click Play Game
-    Console.WriteLine($"[autoloop] Clicking Play at ({_playClickX},{_playClickY})");
-    GameAutoPlayer.ClickAt(_playClickX, _playClickY);
+    Console.WriteLine($"[autoloop] Clicking Play at ({gctx.PlayClickX},{_playClickY})");
+    GameAutoPlayer.ClickAt(gctx.PlayClickX, _playClickY);
 
     // Step 4: Wait for ProcessMatch3Start in log
-    _newGameSignal = new TaskCompletionSource<bool>();
+    gctx.NewGameSignal = new TaskCompletionSource<bool>();
     Console.WriteLine("[autoloop] Waiting for new game to start...");
     var timeoutTask = Task.Delay(15000, ct);
-    var completed = await Task.WhenAny(_newGameSignal.Task, timeoutTask);
+    var completed = await Task.WhenAny(gctx.NewGameSignal.Task, timeoutTask);
     if (completed == timeoutTask)
     {
         Console.WriteLine("[autoloop] Timeout — retrying Use + Play...");
         GameAutoPlayer.FocusGameWindow();
         await Task.Delay(300);
-        GameAutoPlayer.ClickAt(_useClickX, _useClickY);
+        GameAutoPlayer.ClickAt(gctx.UseClickX, gctx.UseClickY);
         await Task.Delay(2000);
-        GameAutoPlayer.ClickAt(_playClickX, _playClickY);
+        GameAutoPlayer.ClickAt(gctx.PlayClickX, _playClickY);
 
-        _newGameSignal = new TaskCompletionSource<bool>();
+        gctx.NewGameSignal = new TaskCompletionSource<bool>();
         timeoutTask = Task.Delay(10000, ct);
-        completed = await Task.WhenAny(_newGameSignal.Task, timeoutTask);
+        completed = await Task.WhenAny(gctx.NewGameSignal.Task, timeoutTask);
         if (completed == timeoutTask)
             Console.WriteLine("[autoloop] Still no new game — start manually.");
     }
@@ -558,7 +541,7 @@ async Task AutoStartNewGame(CancellationToken ct)
     {
         Console.WriteLine("[autoloop] New game detected!");
     }
-    _newGameSignal = null;
+    gctx.NewGameSignal = null;
 }
 
 // ── Memory Reader ──
@@ -699,7 +682,7 @@ ProcessMemory? EnsureGameConnection()
                 vtable > Offsets.MinValidPtr && sync == 0 && piecesPtr > Offsets.MinValidPtr)
             {
                 boardAddr = candidateBoard;
-                _lastBoardAddr = boardAddr;
+                gctx.LastBoardAddr = boardAddr;
                 Console.WriteLine($"[+] GameBoard found at 0x{boardAddr:X} (via Config@+0x10)");
                 break;
             }
@@ -728,7 +711,7 @@ ProcessMemory? EnsureGameConnection()
                     bVtable > Offsets.MinValidPtr && bSync == 0 && piecesPtr > Offsets.MinValidPtr)
                 {
                     boardAddr = gsBoardPtr;
-                    _lastBoardAddr = boardAddr;
+                    gctx.LastBoardAddr = boardAddr;
                     Console.WriteLine($"[+] GameBoard found at 0x{boardAddr:X} (via GameState@+0x70→Board@+0x10)");
                     break;
                 }
@@ -793,7 +776,7 @@ ProcessMemory? EnsureGameConnection()
                 score >= 0 && vtable > Offsets.MinValidPtr && sync == 0)
             {
                 gameStateAddr = candidate;
-                _lastGameStateAddr = gameStateAddr;
+                gctx.LastGameStateAddr = gameStateAddr;
                 Console.WriteLine($"[+] GameStateSinglePlayer found at 0x{gameStateAddr:X} (turns={turnsRem}/{config.NumTurns})");
                 break;
             }
@@ -819,7 +802,7 @@ ProcessMemory? EnsureGameConnection()
                     vtable > Offsets.MinValidPtr && sync == 0)
                 {
                     gameStateAddr = candidate;
-                    _lastGameStateAddr = gameStateAddr;
+                    gctx.LastGameStateAddr = gameStateAddr;
                     Console.WriteLine($"[+] GameStateSinglePlayer found at 0x{gameStateAddr:X}");
                     break;
                 }
@@ -865,7 +848,7 @@ ProcessMemory? EnsureGameConnection()
 /// <summary>Fast re-read of the board from cached addresses. Also reads live PRNG and game state.</summary>
 (int[] pieces, MonoRandom rng, int turnsRemaining, int score, int tier, int turnsMade, int[] totalPiecesMatched, int[] tierPiecesMatched)? QuickReadBoard(Match3Config config)
 {
-    if (_lastBoardAddr == 0 || _gameMemory == null) return null;
+    if (gctx.LastBoardAddr == 0 || _gameMemory == null) return null;
     var mem = _gameMemory;
 
     int ri32(ulong addr) => mem.ReadInt32(addr) ?? throw new Exception();
@@ -887,11 +870,11 @@ ProcessMemory? EnsureGameConnection()
             // Step 1: Read PRNG state
             int inext0 = -1, inextp0 = -1;
             MonoRandom? attemptRng = null;
-            if (_lastGameStateAddr != 0)
+            if (gctx.LastGameStateAddr != 0)
             {
                 try
                 {
-                    ulong rndPtr = rptr(_lastGameStateAddr + Offsets.GameState.Rng);
+                    ulong rndPtr = rptr(gctx.LastGameStateAddr + Offsets.GameState.Rng);
                     inext0 = ri32(rndPtr + Offsets.MonoRng.Inext);
                     inextp0 = ri32(rndPtr + Offsets.MonoRng.Inextp);
                     ulong seedArrayPtr = rptr(rndPtr + Offsets.MonoRng.SeedArray);
@@ -909,7 +892,7 @@ ProcessMemory? EnsureGameConnection()
             }
 
             // Step 2: Read pieces array
-            ulong piecesArrayPtr = rptr(_lastBoardAddr + Offsets.Board.Pieces);
+            ulong piecesArrayPtr = rptr(gctx.LastBoardAddr + Offsets.Board.Pieces);
             long arrayLength = ri64(piecesArrayPtr + Offsets.Array.Length);
             if (arrayLength != expectedLen) return null;
 
@@ -928,11 +911,11 @@ ProcessMemory? EnsureGameConnection()
 
             // Step 3: Re-read inext/inextp to detect PRNG drift during pieces read
             bool drifted = false;
-            if (attemptRng != null && _lastGameStateAddr != 0)
+            if (attemptRng != null && gctx.LastGameStateAddr != 0)
             {
                 try
                 {
-                    ulong rndPtr = rptr(_lastGameStateAddr + Offsets.GameState.Rng);
+                    ulong rndPtr = rptr(gctx.LastGameStateAddr + Offsets.GameState.Rng);
                     int inext1 = ri32(rndPtr + Offsets.MonoRng.Inext);
                     int inextp1 = ri32(rndPtr + Offsets.MonoRng.Inextp);
                     if (inext1 != inext0 || inextp1 != inextp0)
@@ -967,17 +950,17 @@ ProcessMemory? EnsureGameConnection()
         int[] totalPiecesMatched = new int[config.Pieces.Length];
         int[] tierPiecesMatched = new int[config.Pieces.Length];
 
-        if (_lastGameStateAddr != 0)
+        if (gctx.LastGameStateAddr != 0)
         {
-            turnsRemaining = ri32(_lastGameStateAddr + Offsets.GameState.TurnsRemaining);
-            score = ri32(_lastGameStateAddr + Offsets.GameState.Score);
-            turnsMade = ri32(_lastGameStateAddr + Offsets.GameState.TurnsMade);
-            tier = ri32(_lastGameStateAddr + Offsets.GameState.Tier);
+            turnsRemaining = ri32(gctx.LastGameStateAddr + Offsets.GameState.TurnsRemaining);
+            score = ri32(gctx.LastGameStateAddr + Offsets.GameState.Score);
+            turnsMade = ri32(gctx.LastGameStateAddr + Offsets.GameState.TurnsMade);
+            tier = ri32(gctx.LastGameStateAddr + Offsets.GameState.Tier);
 
             // Read Int32[] totalPiecesMatched
             try
             {
-                ulong totalMatchedPtr = rptr(_lastGameStateAddr + Offsets.GameState.TotalPieces);
+                ulong totalMatchedPtr = rptr(gctx.LastGameStateAddr + Offsets.GameState.TotalPieces);
                 long totalMatchedLen = ri64(totalMatchedPtr + Offsets.Array.Length);
                 if (totalMatchedLen == config.Pieces.Length)
                 {
@@ -990,7 +973,7 @@ ProcessMemory? EnsureGameConnection()
             // Read Int32[] tierPiecesMatched
             try
             {
-                ulong tierMatchedPtr = rptr(_lastGameStateAddr + Offsets.GameState.TierPieces);
+                ulong tierMatchedPtr = rptr(gctx.LastGameStateAddr + Offsets.GameState.TierPieces);
                 long tierMatchedLen = ri64(tierMatchedPtr + Offsets.Array.Length);
                 if (tierMatchedLen == config.Pieces.Length)
                 {
@@ -1074,7 +1057,7 @@ async Task RunHttpServer(CancellationToken ct)
             if (req.Url?.AbsolutePath == "/api/state")
             {
                 GameSession? session;
-                lock (_lock) { session = _currentSession; }
+                lock (gctx.Lock) { session = gctx.CurrentSession; }
                 var apiObj = BuildApiState(session);
                 var json = JsonSerializer.Serialize(apiObj, new JsonSerializerOptions { WriteIndented = false });
                 var buf = Encoding.UTF8.GetBytes(json);
@@ -1204,14 +1187,14 @@ if (!File.Exists(Path.Combine(settingsDir, "match3_grid.json")))
     // Bottom-right cell center = (gridX + 6*cellSize + cellSize/2, gridY + 6*cellSize + cellSize/2)
     int cellW = (p2.X - p1.X) / 6;
     int cellH = (p2.Y - p1.Y) / 6;
-    _cellSize = (cellW + cellH) / 2; // average
-    _gridX = p1.X - _cellSize / 2;
-    _gridY = p1.Y - _cellSize / 2;
+    gctx.CellSize = (cellW + cellH) / 2; // average
+    gctx.GridX = p1.X - gctx.CellSize / 2;
+    gctx.GridY = p1.Y - gctx.CellSize / 2;
 
     Directory.CreateDirectory(settingsDir);
     File.WriteAllText(Path.Combine(settingsDir, "match3_grid.json"),
-        JsonSerializer.Serialize(new { gridX = _gridX, gridY = _gridY, cellSize = _cellSize }));
-    Console.WriteLine($"[+] Calibration saved: gridX={_gridX}, gridY={_gridY}, cellSize={_cellSize}");
+        JsonSerializer.Serialize(new { gridX = gctx.GridX, gridY = gctx.GridY, cellSize = gctx.CellSize }));
+    Console.WriteLine($"[+] Calibration saved: gridX={gctx.GridX}, gridY={gctx.GridY}, cellSize={gctx.CellSize}");
 }
 
 
@@ -1221,12 +1204,12 @@ foreach (var arg in args)
     if (arg.StartsWith("--strategy="))
     {
         var val = arg.Substring("--strategy=".Length);
-        if (Enum.TryParse<SolverStrategy>(val, true, out var s)) _strategy = s;
+        if (Enum.TryParse<SolverStrategy>(val, true, out var s)) gctx.Strategy = s;
         else Console.WriteLine($"[!] Unknown strategy: {val}. Using Auto.");
     }
-    if (arg == "--autoloop") _autoloop = true;
+    if (arg == "--autoloop") gctx.Autoloop = true;
 }
-Console.WriteLine($"[*] Solver strategy: {_strategy}");
+Console.WriteLine($"[*] Solver strategy: {gctx.Strategy}");
 
 var logTask = Task.Run(() => TailLog(cts.Token));
 var httpTask = Task.Run(() => RunHttpServer(cts.Token));
