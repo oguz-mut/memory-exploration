@@ -89,43 +89,43 @@ class BeamSolver : ISolver
                     int scoreBefore = clone.CascadeScore;
                     clone.MakeMove(x, y, dir);
                     var newPath = new List<SolverMove>(path) { new() { X = x, Y = y, Direction = dir, ScoreAfter = clone.CascadeScore, Description = $"({x},{y}) {dir} +{clone.CascadeScore - scoreBefore}" } };
-                    candidates.Add((clone, newPath, clone.CascadeScore));
+                    candidates.Add((clone, newPath, clone.EffectiveScore));
                 }
             }
             if (candidates.Count == 0) break;
             beam = candidates.OrderByDescending(c => c.score).Take(beamWidth).Select(c => (c.state, c.path)).ToList();
         }
-        if (beam.Count > 0) { var best = beam.OrderByDescending(b => b.state.CascadeScore).First(); _bestScore = best.state.CascadeScore; _bestPath = best.path; }
+        if (beam.Count > 0) { var best = beam.OrderByDescending(b => b.state.EffectiveScore).First(); _bestScore = best.state.CascadeScore; _bestPath = best.path; }
     }
 
     private void GreedyLookahead(SimGameState initialState, int totalTurns, int lookahead)
     {
-        var current = initialState;
-        var path = new List<SolverMove>();
+        const int beamWidth = 4;
+        var beam = new List<(SimGameState state, List<SolverMove> path)> { (initialState, new List<SolverMove>()) };
         for (int turn = 0; turn < totalTurns; turn++)
         {
             if (_solveTimer.ElapsedMilliseconds > beamTimeout) break;
-            if (current.IsGameOver) break;
-            var moves = current.Board.GetAllValidMoves();
-            if (moves.Count == 0) break;
-            int bestMoveScore = -1;
-            (int x, int y, MoveDir dir) bestMove = moves[0];
-            foreach (var (x, y, dir) in moves)
+            var candidates = new List<(SimGameState state, List<SolverMove> path, int score)>();
+            foreach (var (state, path) in beam)
             {
-                if (_solveTimer.ElapsedMilliseconds > beamTimeout) break;
-                _statesExplored++;
-                var clone = current.Clone();
-                clone.MakeMove(x, y, dir);
-                int score = MiniDFS(clone, Math.Min(lookahead, totalTurns - turn - 1));
-                if (score > bestMoveScore) { bestMoveScore = score; bestMove = (x, y, dir); }
+                if (state.IsGameOver) continue;
+                var moves = state.Board.GetAllValidMoves();
+                if (moves.Count == 0) continue;
+                foreach (var (x, y, dir) in moves)
+                {
+                    if (_solveTimer.ElapsedMilliseconds > beamTimeout) break;
+                    _statesExplored++;
+                    var clone = state.Clone();
+                    int scoreBefore = clone.CascadeScore;
+                    clone.MakeMove(x, y, dir);
+                    var newPath = new List<SolverMove>(path) { new() { X = x, Y = y, Direction = dir, ScoreAfter = clone.CascadeScore, Description = $"({x},{y}) {dir} +{clone.CascadeScore - scoreBefore}" } };
+                    candidates.Add((clone, newPath, clone.EffectiveScore));
+                }
             }
-            int scoreBefore = current.CascadeScore;
-            current = current.Clone();
-            current.MakeMove(bestMove.x, bestMove.y, bestMove.dir);
-            path.Add(new SolverMove { X = bestMove.x, Y = bestMove.y, Direction = bestMove.dir, ScoreAfter = current.CascadeScore, Description = $"({bestMove.x},{bestMove.y}) {bestMove.dir} +{current.CascadeScore - scoreBefore}" });
+            if (candidates.Count == 0) break;
+            beam = candidates.OrderByDescending(c => c.score).Take(beamWidth).Select(c => (c.state, c.path)).ToList();
         }
-        _bestScore = current.CascadeScore;
-        _bestPath = path;
+        if (beam.Count > 0) { var best = beam.OrderByDescending(b => b.state.EffectiveScore).First(); _bestScore = best.state.CascadeScore; _bestPath = best.path; }
     }
 
     private int MiniDFS(SimGameState state, int depth)
