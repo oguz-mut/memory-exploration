@@ -40,6 +40,10 @@ h2{color:#ccc;font-size:1.1em;margin:12px 0 6px}
 <body>
 <h1>Match-3 Solver</h1>
 <div id="root"><div class="status waiting">Connecting...</div></div>
+<div style="margin-top:16px;background:#12162a;border:1px solid #2a2e4a;border-radius:8px;padding:16px;max-width:1200px">
+<h2>Solver Stats</h2>
+<div id="stats-content" style="color:#666;margin-top:8px">Loading...</div>
+</div>
 <script>
 const PC = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#e91e63','#00bcd4','#8bc34a'];
 const AR = {right:'\u2192',left:'\u2190',up:'\u2191',down:'\u2193'};
@@ -120,6 +124,30 @@ async function poll() {
 }
 setInterval(poll, 2000);
 poll();
+
+async function pollStats() {
+  try {
+    const d = await (await fetch('/api/stats')).json();
+    let html = '<table style="border-collapse:collapse;font-size:13px;width:100%"><tr>'
+      + '<th style="text-align:left;padding:4px 12px;color:#888;border-bottom:1px solid #2a2e4a">Strategy</th>'
+      + '<th style="text-align:right;padding:4px 12px;color:#888;border-bottom:1px solid #2a2e4a">Games</th>'
+      + '<th style="text-align:right;padding:4px 12px;color:#888;border-bottom:1px solid #2a2e4a">Avg Score</th>'
+      + '<th style="text-align:right;padding:4px 12px;color:#888;border-bottom:1px solid #2a2e4a">Avg Solve</th></tr>';
+    for (const [strat, s] of Object.entries(d.strategies || {})) {
+      const avgScore = s.games > 0 ? Math.round(s.totalPredictedScore / s.games) : 0;
+      const avgMs = s.games > 0 ? Math.round(s.totalSolveMs / s.games) : 0;
+      html += '<tr>'
+        + '<td style="padding:4px 12px;color:#ddd;font-family:monospace">' + strat + '</td>'
+        + '<td style="text-align:right;padding:4px 12px;color:#4caf50">' + s.games + '</td>'
+        + '<td style="text-align:right;padding:4px 12px;color:#ffd700">' + avgScore + '</td>'
+        + '<td style="text-align:right;padding:4px 12px;color:#888">' + avgMs + 'ms</td></tr>';
+    }
+    html += '</table><div style="margin-top:6px;font-size:12px;color:#888">PRNG failures: ' + (d.prngFailures || 0) + '</div>';
+    document.getElementById('stats-content').innerHTML = html;
+  } catch(e) {}
+}
+setInterval(pollStats, 5000);
+pollStats();
 </script>
 </body>
 </html>

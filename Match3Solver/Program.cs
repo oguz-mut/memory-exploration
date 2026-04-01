@@ -337,6 +337,7 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 sw.Stop();
                 result.SolveTime = sw.Elapsed;
+                SolverStats.RecordSolve(stratLabel, result.PredictedScore, sw.ElapsedMilliseconds);
                 session.Solution = result;
                 session.Status = SolveStatus.Solved;
 
@@ -366,6 +367,7 @@ void OnNewGame(int sessionId, Match3Config config)
                 if (!validateBoard.IsMoveValid(firstMove.X, firstMove.Y, firstMove.Direction))
                 {
                     Console.WriteLine($"[!] Move ({firstMove.X},{firstMove.Y}) {firstMove.Direction} is INVALID on actual board — PRNG divergence detected");
+                    SolverStats.RecordPrngFailure();
                     // Log board for diagnostics
                     var sb = new StringBuilder("[!] Board state: ");
                     for (int y = config.Height - 1; y >= 0; y--)
@@ -399,7 +401,10 @@ void OnNewGame(int sessionId, Match3Config config)
                 }, _gridX, _gridY, _cellSize, curPieces);
 
                 if (success)
+                {
                     session.ConsecutiveFailures = 0;
+                    MoveLog.LogMove(settingsDir, session.SessionId, turnsLeft, result.PredictedScore, firstMove, curPieces);
+                }
 
                 if (!success)
                 {
@@ -1072,6 +1077,27 @@ async Task RunHttpServer(CancellationToken ct)
                 lock (_lock) { session = _currentSession; }
                 var apiObj = BuildApiState(session);
                 var json = JsonSerializer.Serialize(apiObj, new JsonSerializerOptions { WriteIndented = false });
+                var buf = Encoding.UTF8.GetBytes(json);
+                resp.ContentType = "application/json";
+                resp.ContentLength64 = buf.Length;
+                await resp.OutputStream.WriteAsync(buf, ct);
+            }
+            else if (req.Url?.AbsolutePath == "/api/stats")
+            {
+                var json = SolverStats.GetJson();
+                var buf = Encoding.UTF8.GetBytes(json);
+                resp.ContentType = "application/json";
+                resp.ContentLength64 = buf.Length;
+                await resp.OutputStream.WriteAsync(buf, ct);
+            }
+            else if (req.Url?.AbsolutePath == "/api/replay")
+            {
+                var gameParam = req.QueryString["game"];
+                string json;
+                if (int.TryParse(gameParam, out int gameId))
+                    json = MoveLog.GetMovesJson(settingsDir, gameId);
+                else
+                    json = "[]";
                 var buf = Encoding.UTF8.GetBytes(json);
                 resp.ContentType = "application/json";
                 resp.ContentLength64 = buf.Length;
