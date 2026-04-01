@@ -54,13 +54,29 @@ static class GameAutoPlayer
         return true;
     }
 
+    /// <summary>
+    /// Clones <paramref name="state"/>, applies <paramref name="move"/>, and returns the resulting
+    /// Chain depth (minimum 1). Chain == 1 means only the initial swap matched; each cascade adds 1.
+    /// Use this to calculate a smarter initial settle delay instead of always waiting 1200ms.
+    /// </summary>
+    static int EstimateCascadeSteps(SimGameState state, SolverMove move)
+    {
+        var clone = state.Clone();
+        clone.MakeMove(move.X, move.Y, move.Direction);
+        return Math.Max(1, clone.Chain);
+    }
+
     static async Task<(int[] pieces, MonoRandom rng)?> WaitForBoardSettle(
         Func<(int[] pieces, MonoRandom rng)?> readBoard,
         int initialDelayMs = 1200,
         int pollIntervalMs = 200,
-        int timeoutMs = 8000)
+        int timeoutMs = 8000,
+        int estimatedCascadeSteps = 1)
     {
-        await Task.Delay(initialDelayMs);
+        int actualInitialDelay = estimatedCascadeSteps > 1
+            ? Math.Max(400, estimatedCascadeSteps * 320 + 200)
+            : initialDelayMs;
+        await Task.Delay(actualInitialDelay);
 
         var first = readBoard();
         if (first == null) return null;
