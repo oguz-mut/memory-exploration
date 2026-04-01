@@ -1,0 +1,227 @@
+using System.Text.Json;
+using MemoryLib;
+using MemoryLib.Models;
+
+namespace MemoryLib.Readers;
+
+class InventoryReader
+{
+    private readonly ProcessMemory _memory;
+    private readonly MemoryRegionScanner _scanner;
+    private ulong _itemVtable;
+    private readonly string _cacheDir;
+    private readonly Dictionary<int, string> _itemDataByTypeId = new();
+
+    public ulong ItemVtable => _itemVtable;
+    public int OffsetItemCode => 0x10;
+    public int OffsetStackCount => 0x1C;
+    public int OffsetInternalNamePtr => 0x20;
+
+    public InventoryReader(ProcessMemory memory, MemoryRegionScanner scanner)
+    {
+        _memory = memory;
+        _scanner = scanner;
+        _cacheDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ProjectGorgonTools");
+    }
+
+    public void LoadItemData(string jsonPath)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(jsonPath));
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                string internalName = prop.Name.StartsWith("item_") ? prop.Name[5..] : prop.Name;
+                try
+                {
+                    int typeId = prop.Value.GetProperty("TypeID").GetInt32();
+                    _itemDataByTypeId[typeId] = internalName;
+                }
+                catch { }
+            }
+            Console.WriteLine($"Loaded {_itemDataByTypeId.Count} items from items.json");
+        }
+        catch { }
+    }
+
+    public bool AutoDiscover()
+    {
+        // Strategy 1 - Cache
+        try
+        {
+            string cachePath = Path.Combine(_cacheDir, "vtable_cache.json");
+            if (File.Exists(cachePath))
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(cachePath));
+                if (doc.RootElement.TryGetProperty("itemVtable", out var el))
+                {
+                    string? hex = el.GetString();
+                    if (hex != null)
+                    {
+                        ulong val = Convert.ToUInt64(hex, 16);
+                        if (val > 0x10000 && val < 0x7FFF_FFFF_FFFF)
+                        {
+                            _itemVtable = val;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+
+        // Strategy 2 - Structural via item name
+        if (_itemDataByTypeId.Count == 0)
+            return false;
+
+        string[] candidates = { "IronSword", "Apple", "RedAster", "BasicStaff", "CottonCloth" };
+
+        foreach (string candidate in candidates)
+        {
+            var hits = _scanner.ScanForUtf16String(candidate, maxResults: 30);
+            foreach (var hit in hits)
+            {
+                ulong strObj = hit.Address - 0x14;
+                var ptrs = _scanner.ScanForPointerTo(strObj, maxResults: 20);
+                foreach (var ptrMatch in ptrs)
+                {
+                    ulong itemInfoBase = ptrMatch.Address - 0x20;
+                    int typeId = _memory.ReadInt32(itemInfoBase + 0x10);
+                    if (typeId <= 0 || typeId >= 1_000_000) continue;
+
+                    var itemPtrs = _scanner.ScanForPointerTo(itemInfoBase, maxResults: 20);
+                    foreach (var itemPtr in itemPtrs)
+                    {
+                        ulong itemBase = itemPtr.Address - 0x10;
+                        if (!ValidateItemObject(itemBase)) continue;
+                        _itemVtable = _memory.ReadPointer(itemBase);
+                        SaveVtableCache();
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool ValidateItemObject(ulong addr)
+    {
+        ulong vtable = _memory.ReadPointer(addr);
+        if (vtable < 0x10000 || vtable > 0x7FFF_FFFF_FFFF) return false;
+
+        int iid = _memory.ReadInt32(addr + 0x18);
+        ushort stackSize = _memory.ReadUInt16(addr + 0x1C);
+        ulong infoPtr = _memory.ReadPointer(addr + 0x10);
+
+        return iid > 0
+            && stackSize >= 1 && stackSize <= 9999
+            && infoPtr > 0x10000 && infoPtr < 0x7FFF_FFFF_FFFF;
+    }
+
+    private void SaveVtableCache()
+    {
+        try
+        {
+            Directory.CreateDirectory(_cacheDir);
+            string cachePath = Path.Combine(_cacheDir, "vtable_cache.json");
+
+            var dict = new Dictionary<string, string>();
+
+            if (File.Exists(cachePath))
+            {
+                try
+                {
+                    using var existing = JsonDocument.Parse(File.ReadAllText(cachePath));
+                    foreach (var prop in existing.RootElement.EnumerateObject())
+                        dict[prop.Name] = prop.Value.GetString() ?? "";
+                }
+                catch { }
+            }
+
+            dict["itemVtable"] = $"0x{_itemVtable:X}";
+            File.WriteAllText(cachePath, JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+
+    public List<InventoryItemSnapshot>? ReadAllItems()
+    {
+        if (_itemVtable == 0) return null;
+
+        var results = new List<InventoryItemSnapshot>();
+        var seen = new HashSet<ulong>();
+        const int chunkSize = 8 * 1024 * 1024;
+
+        foreach (var region in _scanner.GetGameRegions())
+        {
+            ulong regionOffset = 0;
+            while (regionOffset < region.Size)
+            {
+                ulong remaining = region.Size - regionOffset;
+                int readSize = (int)Math.Min(remaining, (ulong)chunkSize);
+                ulong chunkBase = regionOffset;
+                byte[]? chunk = _memory.ReadBytes(region.BaseAddress + regionOffset, readSize);
+                regionOffset += (ulong)readSize;
+
+                if (chunk == null) continue;
+
+                for (int i = 0; i <= chunk.Length - 8; i += 8)
+                {
+                    if (BitConverter.ToUInt64(chunk, i) != _itemVtable) continue;
+
+                    ulong objAddr = region.BaseAddress + chunkBase + (ulong)i;
+                    if (seen.Contains(objAddr)) continue;
+                    seen.Add(objAddr);
+
+                    if (!ValidateItemObject(objAddr)) continue;
+
+                    ulong infoPtr = _memory.ReadPointer(objAddr + 0x10);
+                    int typeId = _memory.ReadInt32(infoPtr + 0x10);
+                    ushort stackSize = _memory.ReadUInt16(objAddr + 0x1C);
+                    byte folderIdx = _memory.ReadByte(objAddr + 0x1F);
+                    bool isEquipped = _memory.ReadBool(objAddr + 0x20);
+                    ulong namePtr = _memory.ReadPointer(infoPtr + 0x20);
+                    string internalName = _memory.ReadMonoString(namePtr)
+                        ?? _itemDataByTypeId.GetValueOrDefault(typeId, $"item_{typeId}");
+
+                    results.Add(new InventoryItemSnapshot
+                    {
+                        ObjectAddress = objAddr,
+                        ItemCode = typeId,
+                        StackCount = stackSize,
+                        InternalName = internalName,
+                        IsEquipped = isEquipped,
+                        FolderIdx = folderIdx
+                    });
+                }
+            }
+        }
+
+        return results.OrderBy(i => i.InternalName).ToList();
+    }
+
+    public void DumpObjectLayout(ulong addr)
+    {
+        Console.WriteLine($"Object layout at 0x{addr:X}:");
+        Console.WriteLine($"  {"Offset",-8} {"Int32",-12} {"Float",-12} {"Pointer / String"}");
+        Console.WriteLine("  " + new string('-', 60));
+
+        for (int off = 0; off <= 0x80; off += 8)
+        {
+            ulong fieldAddr = addr + (ulong)off;
+            int i32 = _memory.ReadInt32(fieldAddr);
+            float f32 = _memory.ReadFloat(fieldAddr);
+            ulong ptr = _memory.ReadPointer(fieldAddr);
+            string extra = "";
+            if (ptr > 0x10000 && ptr < 0x7FFF_FFFF_FFFF)
+            {
+                string? s = _memory.ReadMonoString(ptr, maxLength: 64);
+                extra = s != null ? $"-> \"{s}\"" : $"-> 0x{ptr:X}";
+            }
+            Console.WriteLine($"  +0x{off:X2,-6} {i32,-12} {f32,-12:G6} {extra}");
+        }
+    }
+}
