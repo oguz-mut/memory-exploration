@@ -253,8 +253,8 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 // Log score vs predicted divergence
                 Console.WriteLine($"[score] game={curScore} predicted={lastPredictedFirstMoveScore} tier={curTier}");
-                if (lastPredictedFirstMoveScore >= 0 && Math.Abs(curScore - lastPredictedFirstMoveScore) > 50)
-                    Console.WriteLine($"[!] Score divergence: game={curScore} vs last_predicted={lastPredictedFirstMoveScore}");
+                if (lastPredictedFirstMoveScore > 0 && Math.Abs(curScore - lastPredictedFirstMoveScore) > 50)
+                    Console.WriteLine($"[!] PRNG sync divergence: predicted score {lastPredictedFirstMoveScore} actual {curScore}");
 
                 if (turnsLeft <= 0)
                 {
@@ -287,33 +287,51 @@ void OnNewGame(int sessionId, Match3Config config)
                     // Iterative with move ordering finds better first moves and respects PRNG reality.
                     if (turnsLeft <= 4)
                     {
-                        var mcts = new MCTSSolver();
-                        result = mcts.Solve(state, solveConfig, 5000); // more time for few turns
+                        int budgetMs = 5000; // more time for few turns
+                        ISolver solver = new MCTSSolver();
+                        var solveTask = Task.Run(() => solver.Solve(state, solveConfig, budgetMs));
+                        var completed = await Task.WhenAny(solveTask, Task.Delay(budgetMs + 2000));
+                        result = completed == solveTask
+                            ? await solveTask
+                            : new SolverResult { BestMoves = new List<SolverMove>(), PredictedScore = 0, StatesExplored = 0, Strategy = "timeout" };
+                        if (completed != solveTask) Console.WriteLine("[!] Solver hard timeout");
                         stratLabel = "mcts";
                     }
                     else
                     {
-                        var iter = new IterativeSolver();
-                        int iterBudget = turnsLeft switch
+                        int budgetMs = turnsLeft switch
                         {
                             >= 12 => 7000,  // early game: tier setup is critical
                             >= 8  => 5000,  // mid game: standard budget
                             _     => 4000,  // late game: diminishing returns
                         };
-                        result = iter.Solve(state, solveConfig, iterBudget);
+                        ISolver solver = new IterativeSolver();
+                        var solveTask = Task.Run(() => solver.Solve(state, solveConfig, budgetMs));
+                        var completed = await Task.WhenAny(solveTask, Task.Delay(budgetMs + 2000));
+                        result = completed == solveTask
+                            ? await solveTask
+                            : new SolverResult { BestMoves = new List<SolverMove>(), PredictedScore = 0, StatesExplored = 0, Strategy = "timeout" };
+                        if (completed != solveTask) Console.WriteLine("[!] Solver hard timeout");
                         stratLabel = "iterative";
                     }
                 }
                 else
                 {
                     // Explicit strategy
-                    result = _strategy switch
+                    int budgetMs = 3000;
+                    ISolver solver = _strategy switch
                     {
-                        SolverStrategy.MCTS => new MCTSSolver().Solve(state, solveConfig),
-                        SolverStrategy.Eval => new EvalSolver().Solve(state, solveConfig),
-                        SolverStrategy.Iterative => new IterativeSolver().Solve(state, solveConfig),
-                        _ => new BeamSolver().Solve(state, solveConfig) // Beam
+                        SolverStrategy.MCTS      => (ISolver)new MCTSSolver(),
+                        SolverStrategy.Eval      => new EvalSolver(),
+                        SolverStrategy.Iterative => new IterativeSolver(),
+                        _                        => new BeamSolver() // Beam
                     };
+                    var solveTask = Task.Run(() => solver.Solve(state, solveConfig, budgetMs));
+                    var completed = await Task.WhenAny(solveTask, Task.Delay(budgetMs + 2000));
+                    result = completed == solveTask
+                        ? await solveTask
+                        : new SolverResult { BestMoves = new List<SolverMove>(), PredictedScore = 0, StatesExplored = 0, Strategy = "timeout" };
+                    if (completed != solveTask) Console.WriteLine("[!] Solver hard timeout");
                     stratLabel = _strategy.ToString().ToLower();
                 }
 
