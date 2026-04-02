@@ -28,22 +28,76 @@ public class InventoryReader
 
     public void LoadItemData(string jsonPath)
     {
+        string? actualPath = ResolveItemsJsonPath(jsonPath);
+        if (actualPath == null)
+        {
+            Console.Error.WriteLine($"[InventoryReader] items.json not found. Tried: {jsonPath}");
+            return;
+        }
+
+        Console.WriteLine($"[InventoryReader] Loading items from: {actualPath}");
         try
         {
-            using var doc = JsonDocument.Parse(File.ReadAllText(jsonPath));
+            using var doc = JsonDocument.Parse(File.ReadAllText(actualPath));
             foreach (var prop in doc.RootElement.EnumerateObject())
             {
-                string internalName = prop.Name.StartsWith("item_") ? prop.Name[5..] : prop.Name;
+                string suffix = prop.Name.StartsWith("item_") ? prop.Name[5..] : prop.Name;
                 try
                 {
-                    int typeId = prop.Value.GetProperty("TypeID").GetInt32();
-                    _itemDataByTypeId[typeId] = internalName;
+                    // Pattern 1: key suffix is the numeric TypeID (e.g. "item_12345")
+                    if (int.TryParse(suffix, out int keyTypeId))
+                    {
+                        string internalName = suffix;
+                        if (prop.Value.TryGetProperty("InternalName", out var internalNameEl))
+                            internalName = internalNameEl.GetString() ?? suffix;
+                        _itemDataByTypeId[keyTypeId] = internalName;
+                    }
+                    // Pattern 2: key suffix is the name, TypeID is a field inside (e.g. "item_IronSword")
+                    else if (prop.Value.TryGetProperty("TypeID", out var typeIdEl))
+                    {
+                        int typeId = typeIdEl.GetInt32();
+                        _itemDataByTypeId[typeId] = suffix;
+                    }
                 }
                 catch { }
             }
-            Console.WriteLine($"Loaded {_itemDataByTypeId.Count} items from items.json");
+            Console.WriteLine($"[InventoryReader] Loaded {_itemDataByTypeId.Count} items from {actualPath}");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[InventoryReader] Failed to parse {actualPath}: {ex.Message}");
+        }
+    }
+
+    private static string? ResolveItemsJsonPath(string primaryPath)
+    {
+        Console.WriteLine($"[InventoryReader] Checking path: {primaryPath} (exists: {File.Exists(primaryPath)})");
+        if (File.Exists(primaryPath))
+            return primaryPath;
+
+        // Fallback 1: current working directory
+        string cwdPath = Path.Combine(Environment.CurrentDirectory, "items.json");
+        if (File.Exists(cwdPath))
+        {
+            Console.WriteLine($"[InventoryReader] Found items.json via CWD fallback: {cwdPath}");
+            return cwdPath;
+        }
+
+        // Fallback 2: walk up from AppContext.BaseDirectory up to 6 levels
+        string? dir = AppContext.BaseDirectory;
+        for (int i = 0; i < 6; i++)
+        {
+            if (dir == null) break;
+            string candidate = Path.Combine(dir, "items.json");
+            if (File.Exists(candidate))
+            {
+                Console.WriteLine($"[InventoryReader] Found items.json by walking up {i + 1} level(s): {candidate}");
+                return candidate;
+            }
+            dir = Path.GetDirectoryName(dir);
+        }
+
+        return null;
     }
 
     public bool AutoDiscover()
@@ -74,7 +128,18 @@ public class InventoryReader
 
         // Strategy 2 - Structural via item name
         if (_itemDataByTypeId.Count == 0)
+        {
+            // Try to load items.json from common paths before giving up
+            string? autoPath = ResolveItemsJsonPath(Path.Combine(AppContext.BaseDirectory, "items.json"));
+            if (autoPath != null)
+                LoadItemData(autoPath);
+        }
+
+        if (_itemDataByTypeId.Count == 0)
+        {
+            Console.Error.WriteLine("[InventoryReader] AutoDiscover: no item data loaded; skipping structural scan.");
             return false;
+        }
 
         string[] candidates = { "IronSword", "Apple", "RedAster", "BasicStaff", "CottonCloth" };
 
