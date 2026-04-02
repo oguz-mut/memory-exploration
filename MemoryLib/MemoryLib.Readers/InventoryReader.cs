@@ -4,7 +4,7 @@ using MemoryLib.Models;
 
 namespace MemoryLib.Readers;
 
-class InventoryReader
+public class InventoryReader
 {
     private readonly ProcessMemory _memory;
     private readonly MemoryRegionScanner _scanner;
