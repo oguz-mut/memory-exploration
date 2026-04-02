@@ -1,4 +1,6 @@
 using System;
+using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -68,34 +70,37 @@ public sealed class ProcessMemory : IDisposable
     {
         const uint TH32CS_SNAPPROCESS = 0x2;
         IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
-            return null;
-
-        try
+        if (snapshot != IntPtr.Zero && snapshot != new IntPtr(-1))
         {
-            var entry = new PROCESSENTRY32();
-            entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
-
-            if (!Process32First(snapshot, ref entry))
-                return null;
-
-            do
+            try
             {
-                string exe = entry.szExeFile ?? string.Empty;
-                if (exe.IndexOf("WindowsPlayer", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    exe.IndexOf("Gorgon", StringComparison.OrdinalIgnoreCase) >= 0)
+                var entry = new PROCESSENTRY32();
+                entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+
+                if (Process32First(snapshot, ref entry))
                 {
-                    return (int)entry.th32ProcessID;
+                    do
+                    {
+                        string exe = entry.szExeFile ?? string.Empty;
+                        if (exe.IndexOf("WindowsPlayer", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            exe.IndexOf("Gorgon", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            return (int)entry.th32ProcessID;
+                        }
+                    }
+                    while (Process32Next(snapshot, ref entry));
                 }
             }
-            while (Process32Next(snapshot, ref entry));
+            finally
+            {
+                CloseHandle(snapshot);
+            }
+        }
 
-            return null;
-        }
-        finally
-        {
-            CloseHandle(snapshot);
-        }
+        // Fallback: Toolhelp32 may fail on some Windows 11 configurations
+        var proc = Process.GetProcessesByName("WindowsPlayer").FirstOrDefault()
+                ?? Process.GetProcessesByName("Gorgon").FirstOrDefault();
+        return proc?.Id;
     }
 
     public static ProcessMemory Open(int pid)
