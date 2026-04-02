@@ -47,34 +47,68 @@ public sealed class SkillReader
         }
         catch { }
 
-        // Strategy 2 - Structural discovery
-        string[] probeSkills = { "Cooking", "Mycology", "Sword", "Carpentry", "Foraging" };
-        foreach (string probe in probeSkills)
+        // Strategy 2 — Brute-force vtable grouping
+        // Scan all private regions once, checking value patterns at every 8-byte-aligned offset.
+        // Candidates that pass all field-range checks are tallied by vtable pointer value.
+        // The most-common vtable (min 5 instances) is almost certainly RuntimeSkillData's vtable.
+        var vtableCounts = new Dictionary<ulong, int>();
+        foreach (var region in _scanner.GetGameRegions())
         {
-            var hits = _scanner.ScanForUtf16String(probe, maxResults: 50);
-            foreach (var hit in hits)
+            ulong chunkBase = 0;
+            while (chunkBase < region.Size)
             {
-                ulong strObjAddr = hit.Address - 0x14;
-                var ptrs = _scanner.ScanForPointerTo(strObjAddr, maxResults: 30);
-                foreach (var ptrMatch in ptrs)
+                ulong remaining = region.Size - chunkBase;
+                int readSize = (int)Math.Min(remaining, (ulong)(8 * 1024 * 1024));
+                ulong readAddr = region.BaseAddress + chunkBase;
+
+                byte[]? chunk = _memory.ReadBytes(readAddr, readSize);
+                if (chunk != null)
                 {
-                    for (int backStep = 0; backStep <= 10; backStep++)
+                    // i + 0x28 <= chunk.Length ensures we can safely read maxRaw at i+0x24 (4 bytes)
+                    for (int i = 0; i + 0x28 <= chunk.Length; i += 8)
                     {
-                        ulong candidateBase = ptrMatch.Address - (ulong)(backStep * 8);
-                        ulong vtable = _memory.ReadPointer(candidateBase);
+                        ulong vtable = BitConverter.ToUInt64(chunk, i);
                         if (vtable <= 0x10000 || vtable > 0x7FFF_FFFF_FFFFul) continue;
-                        if (ValidateSkillObject(candidateBase))
+
+                        int rawLevel   = BitConverter.ToInt32(chunk, i + 0x14);
+                        int bonusLevel = BitConverter.ToInt32(chunk, i + 0x18);
+                        int xpToNext   = BitConverter.ToInt32(chunk, i + 0x20);
+                        int maxRaw     = BitConverter.ToInt32(chunk, i + 0x24);
+
+                        if (rawLevel   >= 0 && rawLevel   <= 100
+                         && bonusLevel >= 0 && bonusLevel <= 50
+                         && xpToNext   >= 0 && xpToNext   <= 10_000_000
+                         && maxRaw     >= 5 && maxRaw     <= 100)
                         {
-                            _skillVtable = vtable;
-                            SaveVtableCache();
-                            return true;
+                            vtableCounts.TryGetValue(vtable, out int count);
+                            vtableCounts[vtable] = count + 1;
                         }
                     }
                 }
+
+                chunkBase += (ulong)readSize;
             }
         }
 
-        return false;
+        if (vtableCounts.Count == 0) return false;
+
+        ulong winner = 0;
+        int winnerCount = 0;
+        foreach (var kv in vtableCounts)
+        {
+            if (kv.Value > winnerCount)
+            {
+                winnerCount = kv.Value;
+                winner = kv.Key;
+            }
+        }
+
+        if (winnerCount < 5) return false;
+        if (!ValidateSkillVtable(winner)) return false;
+
+        _skillVtable = winner;
+        SaveVtableCache();
+        return true;
     }
 
     private bool ValidateSkillObject(ulong addr)
