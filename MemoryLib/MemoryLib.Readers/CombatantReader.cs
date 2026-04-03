@@ -133,13 +133,36 @@ public sealed class CombatantReader
             _combatantAddr = combatantAddr;
         }
 
+        Console.WriteLine($"[Combatant] Reading local combatant @ 0x{combatantAddr:X}");
+
         bool isDead = _memory.ReadBool(combatantAddr + 0xA9);
+
+        // Log the dict pointer at +0x90 and scan all adjacent offsets +0x80..+0xA0
+        ulong primaryDictPtr = _memory.ReadPointer(combatantAddr + 0x90);
+        Console.WriteLine($"[Combatant] Dict pointer at +0x90: 0x{primaryDictPtr:X} " +
+            $"({(IsValidPointer(primaryDictPtr) ? "VALID" : "INVALID")})");
+
+        Console.WriteLine("[Combatant] Scanning combatant+0x80..0xA0 for valid pointers:");
+        for (int off = 0x80; off <= 0xA0; off += 8)
+        {
+            ulong ptr = _memory.ReadPointer(combatantAddr + (ulong)off);
+            if (IsValidPointer(ptr))
+                Console.WriteLine($"  +0x{off:X2}: 0x{ptr:X}  <-- valid pointer");
+            else
+                Console.WriteLine($"  +0x{off:X2}: 0x{ptr:X}");
+        }
 
         // Try the primary dict pointer (+0x90) and adjacent candidates (+0x88, +0x98) if needed.
         ulong dictPtr = ResolveDictPointer(combatantAddr);
-        if (dictPtr == 0) return null;
+        if (dictPtr == 0)
+        {
+            Console.WriteLine("[Combatant] No valid dict pointer found at +0x88/0x90/0x98 — aborting.");
+            return null;
+        }
 
+        Console.WriteLine($"[Combatant] Using dict pointer: 0x{dictPtr:X}");
         var attributes = ReadAttributeDictionary(dictPtr);
+        Console.WriteLine($"[Combatant] ReadAttributeDictionary returned {attributes.Count} entries.");
 
         return new CombatantSnapshot
         {
@@ -200,35 +223,194 @@ public sealed class CombatantReader
 
     private Dictionary<int, double> ReadAttributeDictionary(ulong dictAddr)
     {
-        foreach (var v in Variants)
+        // ── Step 1: dump the first 0x40 bytes of the dictionary object ──────────
+        Console.WriteLine($"[Dict] Raw bytes at dict object 0x{dictAddr:X}:");
+        byte[]? dictBytes = _memory.ReadBytes(dictAddr, 0x40);
+        if (dictBytes == null)
         {
-            int count = _memory.ReadInt32(dictAddr + v.CountOffset);
-            if (count < 1 || count > 2000) continue;
-
-            ulong entriesArrayPtr = _memory.ReadPointer(dictAddr + v.EntriesOffset);
-            if (!IsValidPointer(entriesArrayPtr)) continue;
-
-            // IL2CPP array max_length lives at either +0x18 or +0x8 depending on the Unity version.
-            // Try both positions; pick the one that gives a plausible length >= count.
-            int maxLength = _memory.ReadInt32(entriesArrayPtr + 0x18);
-            if (maxLength <= 0 || maxLength > 8192)
-                maxLength = _memory.ReadInt32(entriesArrayPtr + 0x8);
-            if (maxLength <= 0 || maxLength > 8192) continue;
-
-            ulong dataStart = entriesArrayPtr + v.ArrayDataOffset;
-            var result = ProbeEntries(dataStart, count, maxLength, v);
-            if (result.Count >= count / 2)
+            Console.WriteLine("  <read failed>");
+        }
+        else
+        {
+            for (int off = 0; off < 0x40; off += 4)
             {
-                Console.WriteLine($"[CombatantReader] Dictionary variant worked: " +
-                    $"count@+0x{v.CountOffset:X}, entries@+0x{v.EntriesOffset:X}, " +
-                    $"data@array+0x{v.ArrayDataOffset:X}, entrySize={v.EntrySize}, " +
-                    $"key@+{v.KeyOffset}, val@+{v.ValueOffset} => {result.Count}/{count} entries");
-                return result;
+                int val = BitConverter.ToInt32(dictBytes, off);
+                Console.WriteLine($"  +0x{off:X2} = {val,10} (0x{(uint)val:X8})");
             }
         }
 
-        Console.WriteLine($"[CombatantReader] ReadAttributeDictionary: no variant yielded entries for dict 0x{dictAddr:X}");
-        return new Dictionary<int, double>();
+        // ── Step 2: find all plausible _count candidates (10..2000) ─────────────
+        Console.WriteLine("[Dict] Probing for plausible _count (10..2000) at +0x10..+0x40:");
+        var countCandidates = new List<(uint off, int count)>();
+        for (uint off = 0x10; off <= 0x40; off += 4)
+        {
+            int val = _memory.ReadInt32(dictAddr + off);
+            if (val >= 10 && val <= 2000)
+            {
+                Console.WriteLine($"  dict+0x{off:X2} = {val}  <-- plausible _count");
+                countCandidates.Add((off, val));
+            }
+        }
+        if (countCandidates.Count == 0)
+            Console.WriteLine("  (none found)");
+
+        // ── Step 3: find all valid pointer candidates (potential _entries) ───────
+        Console.WriteLine("[Dict] Probing for valid _entries pointers at +0x10..+0x40:");
+        var entriesCandidates = new List<(uint off, ulong ptr)>();
+        for (uint off = 0x10; off <= 0x40; off += 8)
+        {
+            ulong ptr = _memory.ReadPointer(dictAddr + off);
+            if (IsValidPointer(ptr))
+            {
+                Console.WriteLine($"  dict+0x{off:X2} = 0x{ptr:X}  <-- valid pointer");
+                entriesCandidates.Add((off, ptr));
+            }
+        }
+        if (entriesCandidates.Count == 0)
+            Console.WriteLine("  (none found)");
+
+        // ── Step 4: for each entries pointer, dump its array header ──────────────
+        foreach (var (eOff, entriesPtr) in entriesCandidates)
+        {
+            Console.WriteLine($"[Dict] Entries array at dict+0x{eOff:X2} = 0x{entriesPtr:X} (first 0x40 bytes):");
+            byte[]? arrBytes = _memory.ReadBytes(entriesPtr, 0x40);
+            if (arrBytes == null)
+            {
+                Console.WriteLine("  <read failed>");
+            }
+            else
+            {
+                Console.WriteLine($"  raw: {BitConverter.ToString(arrBytes)}");
+                for (int i = 0; i < 0x40; i += 8)
+                {
+                    ulong qw = BitConverter.ToUInt64(arrBytes, i);
+                    int   dw = BitConverter.ToInt32(arrBytes, i);
+                    Console.WriteLine($"  +0x{i:X2}  qword=0x{qw:X16}  int32={dw}");
+                }
+            }
+        }
+
+        // ── Step 5: try all (countOff, entriesOff, arrayHeaderSize, entrySize) combos ──
+        //
+        // Array header sizes:
+        //   0x20 = klass(8) + monitor(8) + bounds(8) + max_length(8)  [standard IL2CPP]
+        //   0x18 = klass(8) + monitor(8) + max_length(8)              [compact 1D array]
+        //   0x10 = klass(8) + max_length(8)                           [no-monitor]
+        //
+        int[] arrayDataOffsets = [0x20, 0x18, 0x10];
+        int[] entrySizes       = [16, 20, 24, 28, 32];
+
+        Dictionary<int, double>? best = null;
+        int bestScore = 0;
+
+        foreach (var (cOff, count) in countCandidates)
+        {
+            foreach (var (eOff, entriesPtr) in entriesCandidates)
+            {
+                if (cOff == eOff) continue; // same offset can't be both count and entries
+
+                // Determine max_length from the entries array at a few plausible positions.
+                int maxLength = 0;
+                foreach (int mlOff in new[] { 0x18, 0x10, 0x8 })
+                {
+                    int ml = _memory.ReadInt32(entriesPtr + (ulong)mlOff);
+                    if (ml >= count && ml <= 8192) { maxLength = ml; break; }
+                }
+                if (maxLength == 0) maxLength = count * 2; // fallback — allow any reasonable scan
+
+                foreach (int dataOff in arrayDataOffsets)
+                {
+                    foreach (int entrySize in entrySizes)
+                    {
+                        ulong dataStart = entriesPtr + (ulong)dataOff;
+
+                        // For each entry size, try a few (keyOff, valOff) layouts.
+                        // Standard: hashCode(4)+next(4)+key(4)+pad(4)+val(8) => key@+8, val@+16 (24-byte)
+                        // Compact:  hashCode(4)+next(4)+key(4)+val(8)        => key@+8, val@+12 (20-byte, no pad)
+                        // Tight:    hashCode(4)+key(4)+val(8)                => key@+4, val@+8  (16-byte)
+                        var keyValLayouts = entrySize switch
+                        {
+                            16 => new[] { (4, 8) },
+                            20 => new[] { (8, 12) },
+                            24 => new[] { (8, 16) },
+                            28 => new[] { (8, 16), (8, 20) },
+                            32 => new[] { (8, 16), (8, 24) },
+                            _  => new[] { (8, 16) },
+                        };
+
+                        foreach (var (keyOff, valOff) in keyValLayouts)
+                        {
+                            var v = new DictVariant(
+                                CountOffset:     cOff,
+                                EntriesOffset:   eOff,
+                                ArrayDataOffset: (uint)dataOff,
+                                EntrySize:       entrySize,
+                                ValueOffset:     (uint)valOff,
+                                KeyOffset:       (uint)keyOff);
+
+                            var result = ProbeEntries(dataStart, count, maxLength, v);
+                            bool plausible = result.Count >= count / 2;
+
+                            if (result.Count > 0)
+                            {
+                                Console.WriteLine(
+                                    $"[Dict] count@+0x{cOff:X2}={count}, entries@+0x{eOff:X2}, " +
+                                    $"data@+0x{dataOff:X}, entrySize={entrySize}, " +
+                                    $"key@+{keyOff}, val@+{valOff} => {result.Count}/{count} entries" +
+                                    (plausible ? "  <-- PLAUSIBLE" : ""));
+                            }
+
+                            if (plausible && result.Count > bestScore)
+                            {
+                                bestScore = result.Count;
+                                best = result;
+
+                                Console.WriteLine(
+                                    $"[Dict] *** Best so far: count@+0x{cOff:X2}={count}, " +
+                                    $"entries@+0x{eOff:X2}, data@+0x{dataOff:X}, " +
+                                    $"entrySize={entrySize}, key@+{keyOff}, val@+{valOff} " +
+                                    $"=> {result.Count} entries ***");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Step 6: fall back to the pre-built Variants if the exhaustive probe failed ──
+        if (best == null)
+        {
+            Console.WriteLine("[Dict] Exhaustive probe found nothing — trying pre-built Variants:");
+            foreach (var v in Variants)
+            {
+                int count = _memory.ReadInt32(dictAddr + v.CountOffset);
+                if (count < 1 || count > 2000) continue;
+
+                ulong entriesArrayPtr = _memory.ReadPointer(dictAddr + v.EntriesOffset);
+                if (!IsValidPointer(entriesArrayPtr)) continue;
+
+                int maxLength = _memory.ReadInt32(entriesArrayPtr + 0x18);
+                if (maxLength <= 0 || maxLength > 8192)
+                    maxLength = _memory.ReadInt32(entriesArrayPtr + 0x8);
+                if (maxLength <= 0 || maxLength > 8192) continue;
+
+                ulong dataStart = entriesArrayPtr + v.ArrayDataOffset;
+                var result = ProbeEntries(dataStart, count, maxLength, v);
+                if (result.Count >= count / 2)
+                {
+                    Console.WriteLine(
+                        $"[Dict] Variant worked: count@+0x{v.CountOffset:X}, entries@+0x{v.EntriesOffset:X}, " +
+                        $"data@array+0x{v.ArrayDataOffset:X}, entrySize={v.EntrySize}, " +
+                        $"key@+{v.KeyOffset}, val@+{v.ValueOffset} => {result.Count}/{count} entries");
+                    return result;
+                }
+            }
+
+            Console.WriteLine($"[Dict] ReadAttributeDictionary: no variant yielded entries for dict 0x{dictAddr:X}");
+            return new Dictionary<int, double>();
+        }
+
+        return best;
     }
 
     private Dictionary<int, double> ProbeEntries(ulong dataStart, int count, int maxLength, DictVariant v)
