@@ -222,8 +222,11 @@ public sealed class CombatantReader
     ];
 
     /// <summary>
-    /// Primary entry point: tries empirical stride detection first, falls back to
-    /// exhaustive variant probing if the stride signal is too weak.
+    /// Reads the attribute dictionary using the empirically confirmed layout:
+    ///   count  @ dict+0x20 (int32)
+    ///   entries @ dict+0x18 (pointer — NO IL2CPP array header, data starts directly)
+    /// Tries stride 0x20 and 0x40 with all plausible value/key offset combinations,
+    /// picks whichever yields the most plausible entries.
     /// </summary>
     private Dictionary<int, double> ReadAttributeDictionary(ulong dictAddr)
     {
@@ -241,29 +244,29 @@ public sealed class CombatantReader
             Console.WriteLine($"  +0x{off:X2} = {i32,12} (0x{(uint)i32:X8})");
         }
 
-        // ── Use known layout from live test: count@+0x20, entries ptr@+0x18 ──
+        // ── Empirical layout: count@+0x20, entries ptr@+0x18 ─────────────────
         int count = BitConverter.ToInt32(dictBytes, 0x20);
         ulong entriesPtr = BitConverter.ToUInt64(dictBytes, 0x18);
-        Console.WriteLine($"[Dict] Known layout: count={count} (dict+0x20), entriesPtr=0x{entriesPtr:X} (dict+0x18)");
+        Console.WriteLine($"[Dict] count={count} (dict+0x20), entriesPtr=0x{entriesPtr:X} (dict+0x18)");
 
         if (count < 1 || count > 2000 || !IsValidPointer(entriesPtr))
         {
-            Console.WriteLine("[Dict] Known layout invalid — falling back to exhaustive probe.");
+            Console.WriteLine("[Dict] Empirical layout invalid — falling back to exhaustive probe.");
             return ReadAttributeDictionaryExhaustive(dictAddr);
         }
 
-        // ── Read 8KB directly from entriesPtr — no IL2CPP array header assumed ──
-        const int ScanSize = 8192;
-        byte[]? eb = _memory.ReadBytes(entriesPtr, ScanSize);
+        // ── Read entries directly — NO IL2CPP array header prefix ────────────
+        int readSize = Math.Min(Math.Max(4096, count * 0x40 + 0x100), 65536);
+        byte[]? eb = _memory.ReadBytes(entriesPtr, readSize);
         if (eb == null)
         {
             Console.WriteLine("[Dict] Entries read failed — falling back.");
             return ReadAttributeDictionaryExhaustive(dictAddr);
         }
 
-        // ── Raw dump: first 256 bytes as qword hex + decoded double ──────────
-        Console.WriteLine($"[Dict] First 256 bytes from entriesPtr 0x{entriesPtr:X}:");
-        for (int off = 0; off < 256 && off + 8 <= eb.Length; off += 8)
+        // ── Raw dump: first 0x200 bytes as qword hex + decoded double ─────────
+        Console.WriteLine($"[Dict] First 0x200 bytes from entriesPtr 0x{entriesPtr:X}:");
+        for (int off = 0; off < 0x200 && off + 8 <= eb.Length; off += 8)
         {
             ulong  qw = BitConverter.ToUInt64(eb, off);
             double d  = BitConverter.ToDouble(eb, off);
@@ -271,88 +274,53 @@ public sealed class CombatantReader
             Console.WriteLine($"  +0x{off:X3}  0x{qw:X16}  double={ds}");
         }
 
-        // ── Scan every 8-byte aligned offset for game-value doubles [1.0, 100000.0] ──
-        var gameOffsets = new List<int>();
-        for (int off = 0; off + 8 <= eb.Length; off += 8)
+        // ── Try strides 0x20 and 0x40 with all plausible val/key offsets ──────
+        // Empirically confirmed: doubles every 0x20 bytes, some at +0x00/+0x08,
+        // others at +0x10; key is an int32 somewhere in the same 0x20 block.
+        var strideConfigs = new (int stride, int[] valOffsets, int[] keyOffsets)[]
         {
-            double d = BitConverter.ToDouble(eb, off);
-            if (!double.IsNaN(d) && !double.IsInfinity(d) && d >= 1.0 && d <= 100_000.0)
-                gameOffsets.Add(off);
-        }
-        Console.WriteLine($"[Dict] {gameOffsets.Count} game-value doubles in [1.0,100000.0] (first 20):");
-        foreach (int off in gameOffsets.Take(20))
-            Console.WriteLine($"  +0x{off:X3}  {BitConverter.ToDouble(eb, off):G8}");
-
-        if (gameOffsets.Count < 4)
-        {
-            Console.WriteLine("[Dict] Too few game values to detect stride — falling back.");
-            return ReadAttributeDictionaryExhaustive(dictAddr);
-        }
-
-        // ── Find most common delta between consecutive game-value offsets ─────
-        var deltaCounts = new Dictionary<int, int>();
-        for (int i = 1; i < gameOffsets.Count; i++)
-        {
-            int delta = gameOffsets[i] - gameOffsets[i - 1];
-            if (delta > 0 && delta <= 256)
-                deltaCounts[delta] = deltaCounts.GetValueOrDefault(delta) + 1;
-        }
-
-        int entryStride = 0, strideTally = 0;
-        foreach (var (delta, tally) in deltaCounts)
-        {
-            if (tally > strideTally) { strideTally = tally; entryStride = delta; }
-        }
-        Console.WriteLine($"[Dict] Detected entry stride = {entryStride} bytes ({strideTally} votes)");
-
-        if (entryStride < 8 || entryStride > 256 || strideTally < 2)
-        {
-            Console.WriteLine("[Dict] Stride signal too weak — falling back.");
-            return ReadAttributeDictionaryExhaustive(dictAddr);
-        }
-
-        // ── Determine value offset within an entry (value is 8-byte aligned) ──
-        int valOff = gameOffsets[0] % entryStride;
-        Console.WriteLine($"[Dict] Value offset within entry = +0x{valOff:X} ({valOff})");
-
-        // ── Try candidate key offsets (scan backward from value in 4-byte steps) ──
-        // Standard .NET layout: hashCode(4)+next(4)+key(4)+[pad]+val(8)
-        // → key is typically 4, 8, or 12 bytes before val.
-        var keyOffCandidates = new List<int>();
-        for (int kOff = valOff - 4; kOff >= 0; kOff -= 4)
-            keyOffCandidates.Add(kOff);
-        // Also try positions after the value (val-first layouts)
-        if (valOff + 8 + 0 < entryStride) keyOffCandidates.Add(valOff + 8);
-        if (valOff + 8 + 4 < entryStride) keyOffCandidates.Add(valOff + 12);
-
-        int limit = Math.Min(count * 2, eb.Length / entryStride);
+            (0x20, new[] { 0x00, 0x08, 0x10 }, new[] { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C }),
+            (0x40, new[] { 0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38 },
+                   new[] { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C }),
+        };
 
         Dictionary<int, double>? best = null;
-        foreach (int keyOff in keyOffCandidates)
+
+        foreach (var (stride, valOffsets, keyOffsets) in strideConfigs)
         {
-            if (keyOff < 0 || keyOff + 4 > entryStride) continue;
-
-            var candidate = new Dictionary<int, double>(count);
-            for (int i = 0; i < limit; i++)
+            int maxEntries = Math.Min(count * 2, eb.Length / stride);
+            foreach (int valOff in valOffsets)
             {
-                int entryBase = i * entryStride;
-                int needEnd   = entryBase + Math.Max(valOff + 8, keyOff + 4);
-                if (needEnd > eb.Length) break;
+                if (valOff + 8 > stride) continue;
+                foreach (int keyOff in keyOffsets)
+                {
+                    if (keyOff == valOff || keyOff + 4 > stride || keyOff + 4 > valOff + 8 && keyOff < valOff) continue;
+                    // avoid key overlapping the double bytes
+                    if (keyOff >= valOff && keyOff < valOff + 8) continue;
 
-                double value = BitConverter.ToDouble(eb, entryBase + valOff);
-                if (double.IsNaN(value) || double.IsInfinity(value) || Math.Abs(value) > 1e12) continue;
+                    var candidate = new Dictionary<int, double>(count);
+                    for (int i = 0; i < maxEntries; i++)
+                    {
+                        int entryBase = i * stride;
+                        if (entryBase + Math.Max(valOff + 8, keyOff + 4) > eb.Length) break;
 
-                int key = BitConverter.ToInt32(eb, entryBase + keyOff);
-                if (key < 0 || key >= 10_000) continue;
+                        double value = BitConverter.ToDouble(eb, entryBase + valOff);
+                        if (double.IsNaN(value) || double.IsInfinity(value) || value < 0.001 || value > 1_000_000.0) continue;
 
-                candidate.TryAdd(key, value);
-                if (candidate.Count >= count) break;
+                        int key = BitConverter.ToInt32(eb, entryBase + keyOff);
+                        if (key < 0 || key >= 10_000) continue;
+
+                        candidate.TryAdd(key, value);
+                        if (candidate.Count >= count) break;
+                    }
+
+                    if (candidate.Count > 0)
+                        Console.WriteLine($"[Dict] stride=0x{stride:X} val=+0x{valOff:X} key=+0x{keyOff:X} => {candidate.Count}/{count} entries");
+
+                    if (best == null || candidate.Count > best.Count)
+                        best = candidate;
+                }
             }
-
-            Console.WriteLine($"[Dict] keyOff=+{keyOff} valOff=+{valOff} stride={entryStride} => {candidate.Count}/{count} entries");
-
-            if (best == null || candidate.Count > best.Count)
-                best = candidate;
         }
 
         if (best is { Count: > 0 })
