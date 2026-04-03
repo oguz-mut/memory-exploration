@@ -1,0 +1,11 @@
+name: Gather Sequence
+bind: F8
+---
+#sequence
+/target Saltpeter Deposit
+/wait 500
+/press 1
+/wait 2000
+/target Iron Deposit
+/wait 500
+/press 1

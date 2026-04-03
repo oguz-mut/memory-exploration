@@ -1,0 +1,11 @@
+name: Heal Rotation
+bind: F5
+---
+# Emergency heal when very low
+[health < 20] /press 5
+# Regular heal when moderately low
+[health < 50] /press 6
+# Combat ability
+[combat] /press 1
+# Default idle action
+/press 2

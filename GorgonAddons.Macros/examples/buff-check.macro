@@ -1,0 +1,9 @@
+name: Buff Check
+bind: F7
+---
+# Rebuff when safe
+[!buff:Armor of Earth][!combat] /press 7
+# Warn in combat
+[!buff:Armor of Earth][combat] /notify Armor of Earth missing!
+# Default combat
+[combat] /press 1
