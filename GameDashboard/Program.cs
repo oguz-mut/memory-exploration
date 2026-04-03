@@ -5,34 +5,17 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using MemoryLib;
+using MemoryLib.Models;
+using MemoryLib.Readers;
 
 class GameDashboard
 {
-    // Win32 API
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool ReadProcessMemory(IntPtr hProc, IntPtr baseAddr, byte[] buffer, IntPtr size, out IntPtr bytesRead);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern IntPtr VirtualQueryEx(IntPtr hProc, IntPtr addr, out MEMORY_BASIC_INFORMATION64 info, IntPtr length);
-    [DllImport("kernel32.dll")]
-    static extern bool CloseHandle(IntPtr h);
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct MEMORY_BASIC_INFORMATION64
-    {
-        public ulong BaseAddress, AllocationBase;
-        public uint AllocationProtect, __alignment1;
-        public ulong RegionSize;
-        public uint State, Protect, Type, __alignment2;
-    }
-
     // Shared state
     static DashboardData _data = new();
     static readonly object _lock = new();
@@ -62,10 +45,8 @@ class GameDashboard
         _logPath = Path.Combine(logDir, "Player.log");
         var prevLogPath = Path.Combine(logDir, "Player-prev.log");
 
-        // Backfill from prev log first (has history), then tail the active log
-        // Figure out which log is active (being written to by the game right now)
         bool playerLogActive = File.Exists(_logPath) && new FileInfo(_logPath).Length > 0;
-        string backfillPath = prevLogPath; // always backfill from prev if it exists
+        string backfillPath = prevLogPath;
 
         if (!playerLogActive)
             _logPath = prevLogPath;
@@ -73,9 +54,93 @@ class GameDashboard
         Console.WriteLine($"Active log: {_logPath}");
         Console.WriteLine($"Backfill from: {backfillPath}");
 
-        // Start background tasks
         var cts = new CancellationTokenSource();
-        var memTask = Task.Run(() => MemoryScanLoop(cts.Token));
+
+        // Start MemoryPoller
+        MemoryPoller? poller = null;
+        ProcessMemory? memory = null;
+        try
+        {
+            memory = ProcessMemory.Open(proc.Id);
+            var scanner = new MemoryRegionScanner(memory);
+            poller = new MemoryPoller(memory, scanner);
+
+            poller.OnSkillsChanged += skills =>
+            {
+                lock (_lock) { _data.Skills = skills; }
+            };
+            poller.OnInventoryChanged += items =>
+            {
+                lock (_lock) { _data.Inventory = items; }
+            };
+            poller.OnCombatantChanged += combatant =>
+            {
+                lock (_lock) { _data.Combatant = combatant; }
+            };
+            poller.OnEffectsChanged += effects =>
+            {
+                lock (_lock) { _data.MemoryEffects = effects; }
+            };
+            poller.OnDeathChanged += isDead =>
+            {
+                lock (_lock)
+                {
+                    string ts = DateTime.Now.ToString("HH:mm:ss");
+                    AddEvent(isDead ? "DEATH" : "ALIVE", isDead ? "Player died" : "Player alive", ts);
+                }
+            };
+            poller.OnError += ex =>
+            {
+                lock (_lock) { _data.Errors.Add($"Poller error: {ex.Message}"); }
+            };
+
+            bool discovered = poller.AutoDiscoverAll();
+            if (discovered)
+            {
+                poller.Start();
+                Console.WriteLine("[MemoryPoller] Started.");
+            }
+            else
+            {
+                Console.WriteLine("[MemoryPoller] AutoDiscover found nothing — running in log-only mode.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MemoryPoller] Failed to open process memory: {ex.Message}");
+            Console.WriteLine("Running in log-only mode.");
+        }
+
+        // Process stats timer (working set, threads, handles)
+        var statsTimer = new System.Timers.Timer(3000);
+        statsTimer.Elapsed += (s, e) =>
+        {
+            try
+            {
+                var p = Process.GetProcessById(_gamePid);
+                lock (_lock)
+                {
+                    _data.MemoryMB = Math.Round(p.WorkingSet64 / 1048576.0, 1);
+                    _data.PrivateMemoryMB = Math.Round(p.PrivateMemorySize64 / 1048576.0, 1);
+                    _data.PeakMemoryMB = Math.Round(p.PeakWorkingSet64 / 1048576.0, 1);
+                    _data.ThreadCount = p.Threads.Count;
+                    _data.HandleCount = p.HandleCount;
+                    _data.LastMemoryScan = DateTime.Now.ToString("HH:mm:ss");
+
+                    _data.MemoryHistory.Add(new MemorySample
+                    {
+                        Time = DateTime.Now.ToString("HH:mm:ss"),
+                        WorkingSetMB = _data.MemoryMB,
+                        PrivateMB = _data.PrivateMemoryMB
+                    });
+                    if (_data.MemoryHistory.Count > 60)
+                        _data.MemoryHistory.RemoveAt(0);
+                }
+            }
+            catch { }
+        };
+        statsTimer.Start();
+
         var logTask = Task.Run(() => LogTailLoop(cts.Token));
         var httpTask = Task.Run(() => RunHttpServer(cts.Token));
 
@@ -84,166 +149,22 @@ class GameDashboard
 
         Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
 
-        try { await Task.WhenAll(memTask, logTask, httpTask); }
+        try { await Task.WhenAll(logTask, httpTask); }
         catch (OperationCanceledException) { }
 
+        statsTimer.Stop();
+        statsTimer.Dispose();
+        poller?.Stop();
+        poller?.Dispose();
+        memory?.Dispose();
+
         Console.WriteLine("Dashboard stopped.");
-    }
-
-    static void MemoryScanLoop(CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            try
-            {
-                ScanMemory();
-            }
-            catch (Exception ex)
-            {
-                lock (_lock) { _data.Errors.Add($"Memory scan error: {ex.Message}"); }
-            }
-            ct.WaitHandle.WaitOne(3000);
-        }
-    }
-
-    static void ScanMemory()
-    {
-        Process proc;
-        try { proc = Process.GetProcessById(_gamePid); }
-        catch { return; }
-
-        var ws = proc.WorkingSet64;
-        var priv = proc.PrivateMemorySize64;
-        var peak = proc.PeakWorkingSet64;
-        var threads = proc.Threads.Count;
-        var handles = proc.HandleCount;
-
-        lock (_lock)
-        {
-            _data.MemoryMB = Math.Round(ws / 1048576.0, 1);
-            _data.PrivateMemoryMB = Math.Round(priv / 1048576.0, 1);
-            _data.PeakMemoryMB = Math.Round(peak / 1048576.0, 1);
-            _data.ThreadCount = threads;
-            _data.HandleCount = handles;
-            _data.LastMemoryScan = DateTime.Now.ToString("HH:mm:ss");
-
-            _data.MemoryHistory.Add(new MemorySample
-            {
-                Time = DateTime.Now.ToString("HH:mm:ss"),
-                WorkingSetMB = _data.MemoryMB,
-                PrivateMB = _data.PrivateMemoryMB
-            });
-            if (_data.MemoryHistory.Count > 60)
-                _data.MemoryHistory.RemoveAt(0);
-        }
-
-        // Quick string scan for live game state
-        IntPtr h = OpenProcess(0x0410, false, _gamePid);
-        if (h == IntPtr.Zero) return;
-
-        var info = new MEMORY_BASIC_INFORMATION64();
-        int infoSize = Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION64));
-        ulong addr = 0;
-        int scanned = 0;
-        long totalRead = 0;
-        long maxRead = 256L * 1024 * 1024;
-
-        var nameplates = new List<string>();
-        var gardenItems = new List<string>();
-        var chatMessages = new List<string>();
-        var zones = new HashSet<string>();
-
-        while (totalRead < maxRead)
-        {
-            IntPtr ret = VirtualQueryEx(h, (IntPtr)addr, out info, (IntPtr)infoSize);
-            if (ret == IntPtr.Zero) break;
-
-            bool isCommitted = info.State == 0x1000;
-            bool isPrivate = info.Type == 0x20000;
-            bool isReadable = (info.Protect & 0x66) != 0;
-
-            if (isCommitted && isPrivate && isReadable && info.RegionSize > 4096)
-            {
-                int chunkSize = (int)Math.Min((long)info.RegionSize, 4L * 1024 * 1024);
-                byte[] buf = new byte[chunkSize];
-                IntPtr bytesRead;
-
-                if (ReadProcessMemory(h, (IntPtr)info.BaseAddress, buf, (IntPtr)chunkSize, out bytesRead))
-                {
-                    int read = (int)bytesRead;
-                    totalRead += read;
-
-                    var strings = ExtractUtf16(buf, read, 10);
-                    foreach (var s in strings)
-                    {
-                        if (s.StartsWith("Nameplate: ") && s.Length < 80)
-                            nameplates.Add(s.Substring(11));
-                        else if (s.Contains("BIOME_") && s.Length < 80)
-                        {
-                            var m = Regex.Match(s, @"BIOME_\w+");
-                            if (m.Success) zones.Add(m.Value);
-                        }
-                        else if ((s.Contains("Marigold") || s.Contains("Cabbage") || s.Contains("Blooming") ||
-                                  s.Contains("Growing") || s.Contains("Thirsty") || s.Contains("Hungry") || s.Contains("Ripe")) &&
-                                 s.Length > 10 && s.Length < 120 && !s.Contains("Unity") && !s.Contains("Assets/"))
-                            gardenItems.Add(s);
-                    }
-
-                    var asciiStrings = ExtractAscii(buf, read, 15);
-                    foreach (var s in asciiStrings)
-                    {
-                        if (s.StartsWith("Nameplate: ") && s.Length < 80)
-                            nameplates.Add(s.Substring(11));
-                        else if (s.Contains("BIOME_") && s.Length < 80)
-                        {
-                            var m = Regex.Match(s, @"BIOME_\w+");
-                            if (m.Success) zones.Add(m.Value);
-                        }
-                        else if (s.StartsWith("<color=") && s.Contains("Global") && s.Length < 300)
-                            chatMessages.Add(s);
-                    }
-                    scanned++;
-                }
-            }
-
-            ulong next = info.BaseAddress + info.RegionSize;
-            if (next <= addr) break;
-            addr = next;
-        }
-
-        CloseHandle(h);
-
-        lock (_lock)
-        {
-            _data.ScannedMB = Math.Round(totalRead / 1048576.0, 1);
-            _data.RegionsScanned = scanned;
-
-            if (nameplates.Count > 0)
-                _data.NearbyEntities = nameplates.Distinct().OrderBy(x => x).ToList();
-            if (zones.Count > 0)
-                _data.CurrentBiomes = zones.OrderBy(x => x).ToList();
-            if (gardenItems.Count > 0)
-                _data.GardenStatus = gardenItems.Distinct().Take(20).ToList();
-            if (chatMessages.Count > 0)
-            {
-                foreach (var msg in chatMessages.Distinct().Take(5))
-                {
-                    if (!_data.RecentChat.Contains(msg))
-                    {
-                        _data.RecentChat.Add(msg);
-                        if (_data.RecentChat.Count > 30) _data.RecentChat.RemoveAt(0);
-                    }
-                }
-            }
-        }
     }
 
     static void LogTailLoop(CancellationToken ct)
     {
         long lastPos = 0;
 
-        // Backfill: process recent log history to populate dashboard on startup
-        // First backfill from prev log (last 1MB), then from active log
         var logsToBackfill = new List<string>();
         var prevPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low",
@@ -258,11 +179,11 @@ class GameDashboard
             try
             {
                 var fi = new FileInfo(logFile);
-                long backfillStart = Math.Max(0, fi.Length - 1024 * 1024); // last 1MB
+                long backfillStart = Math.Max(0, fi.Length - 1024 * 1024);
                 using var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                 fs.Seek(backfillStart, SeekOrigin.Begin);
                 using var reader = new StreamReader(fs);
-                if (backfillStart > 0) reader.ReadLine(); // skip partial line
+                if (backfillStart > 0) reader.ReadLine();
                 string? line;
                 while ((line = reader.ReadLine()) != null)
                     ProcessLogLine(line);
@@ -489,34 +410,6 @@ class GameDashboard
         listener.Stop();
     }
 
-    static List<string> ExtractAscii(byte[] buf, int length, int minLen)
-    {
-        var results = new List<string>();
-        var sb = new StringBuilder();
-        for (int i = 0; i < length; i++)
-        {
-            byte b = buf[i];
-            if (b >= 32 && b < 127) sb.Append((char)b);
-            else { if (sb.Length >= minLen) results.Add(sb.ToString()); sb.Clear(); }
-        }
-        if (sb.Length >= minLen) results.Add(sb.ToString());
-        return results;
-    }
-
-    static List<string> ExtractUtf16(byte[] buf, int length, int minLen)
-    {
-        var results = new List<string>();
-        var sb = new StringBuilder();
-        for (int i = 0; i < length - 1; i += 2)
-        {
-            char c = (char)(buf[i] | (buf[i + 1] << 8));
-            if (c >= 32 && c < 127) sb.Append(c);
-            else { if (sb.Length >= minLen) results.Add(sb.ToString()); sb.Clear(); }
-        }
-        if (sb.Length >= minLen) results.Add(sb.ToString());
-        return results;
-    }
-
     static readonly string DASHBOARD_HTML = @"<!DOCTYPE html>
 <html lang=""en"">
 <head>
@@ -541,6 +434,7 @@ class GameDashboard
   .list-item { padding: 3px 0; border-bottom: 1px solid #1a2235; display: flex; gap: 6px; align-items: flex-start; }
   .list-item .tag { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px; min-width: 54px; text-align: center; flex-shrink: 0; }
   .tag.DEATH { background: #7f1d1d; color: #fca5a5; }
+  .tag.ALIVE { background: #14532d; color: #86efac; }
   .tag.KILL { background: #713f12; color: #fde68a; }
   .tag.LOOT { background: #14532d; color: #86efac; }
   .tag.ZONE { background: #1e3a5f; color: #93c5fd; }
@@ -560,6 +454,17 @@ class GameDashboard
   .quest { padding: 3px 0; font-size: 12px; border-bottom: 1px solid #1a2235; }
   .quest::before { content: ''; display: inline-block; width: 6px; height: 6px; background: #fbbf24; border-radius: 50%; margin-right: 6px; }
   .effect { display: inline-block; background: #14532d; color: #86efac; padding: 2px 8px; border-radius: 4px; margin: 2px; font-size: 11px; }
+  .effect.debuff { background: #7f1d1d; color: #fca5a5; }
+  .skill-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px solid #1a2235; font-size: 12px; }
+  .skill-name { color: #e0e6f0; min-width: 120px; }
+  .skill-level { color: #60a5fa; font-weight: 700; min-width: 40px; text-align: right; }
+  .skill-xp { color: #8899aa; font-size: 11px; min-width: 80px; text-align: right; }
+  .inv-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px solid #1a2235; font-size: 12px; }
+  .inv-name { color: #e0e6f0; flex: 1; }
+  .inv-qty { color: #fbbf24; font-weight: 600; min-width: 40px; text-align: right; }
+  .inv-equipped { color: #4ade80; font-size: 10px; margin-left: 4px; }
+  .hp-bar { height: 8px; background: #1e2a42; border-radius: 4px; margin: 2px 0; overflow: hidden; }
+  .hp-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
   .full-width { grid-column: 1 / -1; }
   .two-col { grid-column: span 2; }
   .scroll { max-height: 300px; overflow-y: auto; }
@@ -585,20 +490,25 @@ class GameDashboard
     <div class=""stat""><span class=""label"">Peak</span><span class=""value"" id=""memPeak"">-</span></div>
     <div class=""stat""><span class=""label"">Threads</span><span class=""value"" id=""threads"">-</span></div>
     <div class=""stat""><span class=""label"">Handles</span><span class=""value"" id=""handles"">-</span></div>
-    <div class=""stat""><span class=""label"">Scanned</span><span class=""value"" id=""scanned"">-</span></div>
+  </div>
+
+  <div class=""card"">
+    <h2>Combat Stats</h2>
+    <div id=""combatHpBar"" class=""hp-bar""><div id=""combatHpFill"" class=""hp-bar-fill"" style=""background:#f87171;width:0%""></div></div>
+    <div class=""stat""><span class=""label"">Health</span><span class=""value"" id=""combatHp"">-</span></div>
+    <div id=""combatPwrBar"" class=""hp-bar""><div id=""combatPwrFill"" class=""hp-bar-fill"" style=""background:#60a5fa;width:0%""></div></div>
+    <div class=""stat""><span class=""label"">Power</span><span class=""value"" id=""combatPwr"">-</span></div>
+    <div id=""combatArmBar"" class=""hp-bar""><div id=""combatArmFill"" class=""hp-bar-fill"" style=""background:#fbbf24;width:0%""></div></div>
+    <div class=""stat""><span class=""label"">Armor</span><span class=""value"" id=""combatArm"">-</span></div>
+    <div class=""stat""><span class=""label"">Status</span><span class=""value"" id=""combatDead"">-</span></div>
   </div>
 
   <div class=""card"">
     <h2>Zone & Environment</h2>
     <div class=""stat""><span class=""label"">Current Zone</span><span class=""value"" id=""zone"">-</span></div>
     <div id=""biomes"" style=""margin-top:6px""></div>
-    <h2 style=""margin-top:10px"">Active Effects</h2>
+    <h2 style=""margin-top:10px"">Active Effects (Log)</h2>
     <div id=""effects""></div>
-  </div>
-
-  <div class=""card"">
-    <h2>Player Attributes</h2>
-    <div class=""attr-grid scroll"" id=""attributes""></div>
   </div>
 
   <div class=""card full-width"">
@@ -606,9 +516,29 @@ class GameDashboard
     <canvas id=""chartCanvas"" height=""120""></canvas>
   </div>
 
+  <div class=""card"">
+    <h2>Skills <span id=""skillCount"" style=""color:#8899aa;font-weight:normal""></span></h2>
+    <div class=""scroll"" id=""skills"" style=""max-height:280px""></div>
+  </div>
+
+  <div class=""card"">
+    <h2>Inventory <span id=""invCount"" style=""color:#8899aa;font-weight:normal""></span></h2>
+    <div class=""scroll"" id=""inventory"" style=""max-height:280px""></div>
+  </div>
+
+  <div class=""card"">
+    <h2>Active Effects (Memory)</h2>
+    <div class=""scroll"" id=""memEffects"" style=""max-height:280px""></div>
+  </div>
+
   <div class=""card two-col"">
     <h2>Live Event Log</h2>
     <div class=""list scroll"" id=""events"" style=""max-height:350px""></div>
+  </div>
+
+  <div class=""card"">
+    <h2>Player Attributes (Log)</h2>
+    <div class=""attr-grid scroll"" id=""attributes""></div>
   </div>
 
   <div class=""card"">
@@ -634,7 +564,7 @@ class GameDashboard
   </div>
 </div>
 
-<div class=""footer"">Refreshes every 2s | Memory scanned every 3s | Log tailed every 500ms</div>
+<div class=""footer"">Refreshes every 2s | Stats polled every 3s | MemoryPoller every 2s | Log tailed every 500ms</div>
 
 <script>
 async function refresh() {
@@ -652,7 +582,60 @@ async function refresh() {
     document.getElementById('memPeak').textContent = (d.peakMemoryMB || 0).toLocaleString() + ' MB';
     document.getElementById('threads').textContent = d.threadCount || 0;
     document.getElementById('handles').textContent = d.handleCount || 0;
-    document.getElementById('scanned').textContent = (d.scannedMB || 0) + ' MB / ' + (d.regionsScanned || 0) + ' rgns';
+
+    // Combat stats
+    var c = d.combatant;
+    if (c) {
+      var hpPct = c.maxHealth > 0 ? Math.round(c.health / c.maxHealth * 100) : 0;
+      var pwrPct = c.maxPower > 0 ? Math.round(c.power / c.maxPower * 100) : 0;
+      var armPct = c.maxArmor > 0 ? Math.round(c.armor / c.maxArmor * 100) : 0;
+      document.getElementById('combatHpFill').style.width = hpPct + '%';
+      document.getElementById('combatPwrFill').style.width = pwrPct + '%';
+      document.getElementById('combatArmFill').style.width = armPct + '%';
+      document.getElementById('combatHp').textContent = Math.round(c.health) + ' / ' + Math.round(c.maxHealth);
+      document.getElementById('combatPwr').textContent = Math.round(c.power) + ' / ' + Math.round(c.maxPower);
+      document.getElementById('combatArm').textContent = Math.round(c.armor) + ' / ' + Math.round(c.maxArmor);
+      document.getElementById('combatDead').textContent = c.isDead ? 'DEAD' : 'Alive';
+      document.getElementById('combatDead').style.color = c.isDead ? '#f87171' : '#4ade80';
+    } else {
+      document.getElementById('combatHp').textContent = '-';
+      document.getElementById('combatPwr').textContent = '-';
+      document.getElementById('combatArm').textContent = '-';
+      document.getElementById('combatDead').textContent = 'No data';
+    }
+
+    // Skills
+    var skills = d.skills || [];
+    document.getElementById('skillCount').textContent = '(' + skills.length + ')';
+    document.getElementById('skills').innerHTML = skills.length > 0
+      ? skills.sort(function(a,b){return b.level - a.level;}).map(function(s) {
+          var xpStr = s.tnl > 0 ? Math.round(s.xp) + ' / ' + Math.round(s.tnl) + ' xp' : 'Max';
+          var bonus = s.bonus > 0 ? ' <span style=""color:#4ade80"">+' + s.bonus + '</span>' : '';
+          return '<div class=""skill-row""><span class=""skill-name"">' + esc(s.name) + bonus + '</span><span class=""skill-level"">' + s.level + '</span><span class=""skill-xp"">' + xpStr + '</span></div>';
+        }).join('')
+      : '<span class=""empty"">Waiting for MemoryPoller...</span>';
+
+    // Inventory
+    var inv = d.inventory || [];
+    document.getElementById('invCount').textContent = '(' + inv.length + ')';
+    document.getElementById('inventory').innerHTML = inv.length > 0
+      ? inv.sort(function(a,b){return a.internalName.localeCompare(b.internalName);}).map(function(i) {
+          var eq = i.isEquipped ? '<span class=""inv-equipped"">[E]</span>' : '';
+          var qty = i.stackCount > 1 ? ' x' + i.stackCount : '';
+          return '<div class=""inv-row""><span class=""inv-name"">' + esc(i.internalName) + eq + '</span><span class=""inv-qty"">' + qty + '</span></div>';
+        }).join('')
+      : '<span class=""empty"">Waiting for MemoryPoller...</span>';
+
+    // Memory effects
+    var mfx = d.memoryEffects || [];
+    document.getElementById('memEffects').innerHTML = mfx.length > 0
+      ? mfx.map(function(e) {
+          var cls = e.isDebuff ? 'effect debuff' : 'effect';
+          var timer = e.remainingTime > 0 ? ' ' + e.remainingTime.toFixed(1) + 's' : '';
+          var stacks = e.stackCount > 1 ? ' x' + e.stackCount : '';
+          return '<span class=""' + cls + '"">' + esc(e.name) + stacks + timer + '</span>';
+        }).join('')
+      : '<span class=""empty"">None</span>';
 
     document.getElementById('zone').textContent = d.currentZone || 'Unknown';
     document.getElementById('biomes').innerHTML = (d.currentBiomes || []).map(function(b) {
@@ -778,8 +761,6 @@ class DashboardData
     public double PeakMemoryMB { get; set; }
     public int ThreadCount { get; set; }
     public int HandleCount { get; set; }
-    public double ScannedMB { get; set; }
-    public int RegionsScanned { get; set; }
     public string LastMemoryScan { get; set; } = "";
     public string CurrentZone { get; set; } = "";
     public List<string> CurrentBiomes { get; set; } = new();
@@ -795,6 +776,12 @@ class DashboardData
     public int LastVendorGold { get; set; }
     public List<MemorySample> MemoryHistory { get; set; } = new();
     public List<GameEvent> EventLog { get; set; } = new();
+
+    // MemoryPoller data
+    public List<MemoryLib.Models.SkillSnapshot>? Skills { get; set; }
+    public List<MemoryLib.Models.InventoryItemSnapshot>? Inventory { get; set; }
+    public MemoryLib.Models.CombatantSnapshot? Combatant { get; set; }
+    public List<MemoryLib.Models.EffectSnapshot>? MemoryEffects { get; set; }
 }
 
 class MemorySample
