@@ -1,11 +1,7 @@
-using System.Text.RegularExpressions;
-
 namespace GorgonAddons.Macros;
 
 public static class MacroParser
 {
-    private static readonly Regex ConditionBlockRegex = new(@"\[([^\]]+)\]", RegexOptions.Compiled);
-
     public static MacroDefinition Parse(string content, string filePath = "")
     {
         var parts = content.Split("\n---\n", 2, StringSplitOptions.None);
