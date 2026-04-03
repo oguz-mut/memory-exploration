@@ -68,8 +68,9 @@ class EvalSolver : ISolver
         var validMoves = state.Board.GetAllValidMoves();
         score += validMoves.Count * 5.0;
 
-        // Extra turn earned by the last move — highest-value event in the game
-        if (state.IsExtraTurnEarned) score += 300.0;
+        // Extra turn earned by the last move — highest-value event, scales with scarcity
+        if (state.IsExtraTurnEarned)
+            score += 300.0 + (state.TurnsRemaining > 0 ? 300.0 / state.TurnsRemaining : 0);
 
         // Turns remaining — more turns means more scoring opportunity
         score += state.TurnsRemaining * 15.0;
