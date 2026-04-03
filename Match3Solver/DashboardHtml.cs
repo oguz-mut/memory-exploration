@@ -100,8 +100,9 @@ function render(d) {
         <div class="stats">Seed: ${c.randomSeed} | Session: ${d.sessionId} | ${d.receivedAt}</div>
       </div>
       <div class="info-panel">
-        <h2>Predicted Score</h2>
-        <div class="score-big">${sol ? sol.predictedScore : '...'}</div>
+        <h2>Game Score</h2>
+        <div class="score-big">${d.gameScore != null ? d.gameScore : '...'}</div>
+        <div style="color:#888;font-size:.85em;margin-top:-8px">Predicted: ${sol ? sol.predictedScore : '...'}</div>
         <h2>Optimal Moves (${c.numTurns} turns)</h2>
         ${movesHtml || '<div style="color:#666">Solving...</div>'}
         ${sol ? '<div class="stats">' + sol.strategy + ' | ' + sol.statesExplored.toLocaleString() + ' states | ' + sol.solveTimeMs + 'ms</div>' : ''}

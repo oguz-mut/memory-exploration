@@ -73,4 +73,5 @@ class GameSession
     public string? ErrorMessage { get; set; }
     public DateTime ReceivedAt { get; set; }
     public int ConsecutiveFailures { get; set; }
+    public int GameScore { get; set; }
 }

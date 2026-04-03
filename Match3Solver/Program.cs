@@ -226,6 +226,7 @@ void OnNewGame(int sessionId, Match3Config config)
                 }
                 var (curPieces, curRng, turnsLeft, curScore, curTier, curTurnsMade, curTotalMatched, curTierMatched) = fresh.Value;
                 session.InitialBoard = curPieces;
+                session.GameScore = curScore;
 
                 // Log compact board grid (top row first)
                 {
@@ -329,6 +330,32 @@ void OnNewGame(int sessionId, Match3Config config)
                 SolverStats.RecordSolve(stratLabel, result.PredictedScore, sw.ElapsedMilliseconds);
                 session.Solution = result;
                 session.Status = SolveStatus.Solved;
+
+                // Timeout fallback: quick depth-1 solve
+                if (result.BestMoves.Count == 0 && turnsLeft > 0)
+                {
+                    Console.WriteLine("[!] Solver hard timeout — using quick fallback");
+                    var fallbackMoves = state.Board.GetAllValidMoves();
+                    if (fallbackMoves.Count > 0)
+                    {
+                        int bestFbScore = int.MinValue;
+                        SolverMove? bestFbMove = null;
+                        foreach (var (fx, fy, fd) in fallbackMoves)
+                        {
+                            var fc = state.Clone();
+                            fc.MakeMove(fx, fy, fd);
+                            if (fc.CascadeScore > bestFbScore)
+                            {
+                                bestFbScore = fc.CascadeScore;
+                                bestFbMove = new SolverMove { X = fx, Y = fy, Direction = fd, ScoreAfter = bestFbScore, Description = $"({fx},{fy}) {fd} fallback" };
+                            }
+                        }
+                        if (bestFbMove != null)
+                        {
+                            result = new SolverResult { BestMoves = new List<SolverMove> { bestFbMove }, PredictedScore = bestFbScore, StatesExplored = fallbackMoves.Count, Strategy = "fallback-depth1" };
+                        }
+                    }
+                }
 
                 if (result.BestMoves.Count == 0)
                 {
@@ -1133,6 +1160,7 @@ object BuildApiState(GameSession? session)
             pieceReqsPerTier = config.PieceReqsPerTier,
             pieces = config.Pieces.Select((p, i) => new { label = p.Label, iconId = p.IconID, tier = p.Tier, itemValue = i < config.PieceValues.Length ? config.PieceValues[i] : 0 }).ToArray()
         },
+        gameScore = session.GameScore,
         board = session.InitialBoard,
         numPieceTypes = session.NumPieceTypes,
         pieceLabels = session.PieceLabels,
