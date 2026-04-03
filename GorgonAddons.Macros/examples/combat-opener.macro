@@ -1,0 +1,9 @@
+name: Combat Opener
+bind: F6
+---
+# AoE with shift modifier
+[mod:shift][combat] /press 3
+# Main attack
+[combat] /press 1
+# Out of combat buff check
+[!buff:Armor of Earth][!combat] /press 7
