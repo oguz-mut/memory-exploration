@@ -190,7 +190,7 @@ public sealed class CombatantReader
         return 0;
     }
 
-    // Layout variant descriptor used during probing.
+    // Layout variant descriptor used during probing (used by exhaustive fallback).
     private readonly record struct DictVariant(
         uint CountOffset,    // offset from dictAddr to int _count
         uint EntriesOffset,  // offset from dictAddr to Entry[] pointer
@@ -221,26 +221,158 @@ public sealed class CombatantReader
         new(0x20, 0x18, 0x20, 16, 8, 4),
     ];
 
+    /// <summary>
+    /// Primary entry point: tries empirical stride detection first, falls back to
+    /// exhaustive variant probing if the stride signal is too weak.
+    /// </summary>
     private Dictionary<int, double> ReadAttributeDictionary(ulong dictAddr)
     {
-        // ── Step 1: dump the first 0x40 bytes of the dictionary object ──────────
-        Console.WriteLine($"[Dict] Raw bytes at dict object 0x{dictAddr:X}:");
+        // ── Raw dump of first 0x40 bytes of the dictionary object ────────────
+        Console.WriteLine($"[Dict] Raw bytes at dict 0x{dictAddr:X}:");
         byte[]? dictBytes = _memory.ReadBytes(dictAddr, 0x40);
         if (dictBytes == null)
         {
             Console.WriteLine("  <read failed>");
+            return new Dictionary<int, double>();
         }
-        else
+        for (int off = 0; off < 0x40; off += 4)
         {
-            for (int off = 0; off < 0x40; off += 4)
-            {
-                int val = BitConverter.ToInt32(dictBytes, off);
-                Console.WriteLine($"  +0x{off:X2} = {val,10} (0x{(uint)val:X8})");
-            }
+            int i32 = BitConverter.ToInt32(dictBytes, off);
+            Console.WriteLine($"  +0x{off:X2} = {i32,12} (0x{(uint)i32:X8})");
         }
 
-        // ── Step 2: find all plausible _count candidates (10..2000) ─────────────
-        Console.WriteLine("[Dict] Probing for plausible _count (10..2000) at +0x10..+0x40:");
+        // ── Use known layout from live test: count@+0x20, entries ptr@+0x18 ──
+        int count = BitConverter.ToInt32(dictBytes, 0x20);
+        ulong entriesPtr = BitConverter.ToUInt64(dictBytes, 0x18);
+        Console.WriteLine($"[Dict] Known layout: count={count} (dict+0x20), entriesPtr=0x{entriesPtr:X} (dict+0x18)");
+
+        if (count < 1 || count > 2000 || !IsValidPointer(entriesPtr))
+        {
+            Console.WriteLine("[Dict] Known layout invalid — falling back to exhaustive probe.");
+            return ReadAttributeDictionaryExhaustive(dictAddr);
+        }
+
+        // ── Read 8KB directly from entriesPtr — no IL2CPP array header assumed ──
+        const int ScanSize = 8192;
+        byte[]? eb = _memory.ReadBytes(entriesPtr, ScanSize);
+        if (eb == null)
+        {
+            Console.WriteLine("[Dict] Entries read failed — falling back.");
+            return ReadAttributeDictionaryExhaustive(dictAddr);
+        }
+
+        // ── Raw dump: first 256 bytes as qword hex + decoded double ──────────
+        Console.WriteLine($"[Dict] First 256 bytes from entriesPtr 0x{entriesPtr:X}:");
+        for (int off = 0; off < 256 && off + 8 <= eb.Length; off += 8)
+        {
+            ulong  qw = BitConverter.ToUInt64(eb, off);
+            double d  = BitConverter.ToDouble(eb, off);
+            string ds = (double.IsNaN(d) || double.IsInfinity(d)) ? "N/A" : $"{d:G8}";
+            Console.WriteLine($"  +0x{off:X3}  0x{qw:X16}  double={ds}");
+        }
+
+        // ── Scan every 8-byte aligned offset for game-value doubles [1.0, 100000.0] ──
+        var gameOffsets = new List<int>();
+        for (int off = 0; off + 8 <= eb.Length; off += 8)
+        {
+            double d = BitConverter.ToDouble(eb, off);
+            if (!double.IsNaN(d) && !double.IsInfinity(d) && d >= 1.0 && d <= 100_000.0)
+                gameOffsets.Add(off);
+        }
+        Console.WriteLine($"[Dict] {gameOffsets.Count} game-value doubles in [1.0,100000.0] (first 20):");
+        foreach (int off in gameOffsets.Take(20))
+            Console.WriteLine($"  +0x{off:X3}  {BitConverter.ToDouble(eb, off):G8}");
+
+        if (gameOffsets.Count < 4)
+        {
+            Console.WriteLine("[Dict] Too few game values to detect stride — falling back.");
+            return ReadAttributeDictionaryExhaustive(dictAddr);
+        }
+
+        // ── Find most common delta between consecutive game-value offsets ─────
+        var deltaCounts = new Dictionary<int, int>();
+        for (int i = 1; i < gameOffsets.Count; i++)
+        {
+            int delta = gameOffsets[i] - gameOffsets[i - 1];
+            if (delta > 0 && delta <= 256)
+                deltaCounts[delta] = deltaCounts.GetValueOrDefault(delta) + 1;
+        }
+
+        int entryStride = 0, strideTally = 0;
+        foreach (var (delta, tally) in deltaCounts)
+        {
+            if (tally > strideTally) { strideTally = tally; entryStride = delta; }
+        }
+        Console.WriteLine($"[Dict] Detected entry stride = {entryStride} bytes ({strideTally} votes)");
+
+        if (entryStride < 8 || entryStride > 256 || strideTally < 2)
+        {
+            Console.WriteLine("[Dict] Stride signal too weak — falling back.");
+            return ReadAttributeDictionaryExhaustive(dictAddr);
+        }
+
+        // ── Determine value offset within an entry (value is 8-byte aligned) ──
+        int valOff = gameOffsets[0] % entryStride;
+        Console.WriteLine($"[Dict] Value offset within entry = +0x{valOff:X} ({valOff})");
+
+        // ── Try candidate key offsets (scan backward from value in 4-byte steps) ──
+        // Standard .NET layout: hashCode(4)+next(4)+key(4)+[pad]+val(8)
+        // → key is typically 4, 8, or 12 bytes before val.
+        var keyOffCandidates = new List<int>();
+        for (int kOff = valOff - 4; kOff >= 0; kOff -= 4)
+            keyOffCandidates.Add(kOff);
+        // Also try positions after the value (val-first layouts)
+        if (valOff + 8 + 0 < entryStride) keyOffCandidates.Add(valOff + 8);
+        if (valOff + 8 + 4 < entryStride) keyOffCandidates.Add(valOff + 12);
+
+        int limit = Math.Min(count * 2, eb.Length / entryStride);
+
+        Dictionary<int, double>? best = null;
+        foreach (int keyOff in keyOffCandidates)
+        {
+            if (keyOff < 0 || keyOff + 4 > entryStride) continue;
+
+            var candidate = new Dictionary<int, double>(count);
+            for (int i = 0; i < limit; i++)
+            {
+                int entryBase = i * entryStride;
+                int needEnd   = entryBase + Math.Max(valOff + 8, keyOff + 4);
+                if (needEnd > eb.Length) break;
+
+                double value = BitConverter.ToDouble(eb, entryBase + valOff);
+                if (double.IsNaN(value) || double.IsInfinity(value) || Math.Abs(value) > 1e12) continue;
+
+                int key = BitConverter.ToInt32(eb, entryBase + keyOff);
+                if (key < 0 || key >= 10_000) continue;
+
+                candidate.TryAdd(key, value);
+                if (candidate.Count >= count) break;
+            }
+
+            Console.WriteLine($"[Dict] keyOff=+{keyOff} valOff=+{valOff} stride={entryStride} => {candidate.Count}/{count} entries");
+
+            if (best == null || candidate.Count > best.Count)
+                best = candidate;
+        }
+
+        if (best is { Count: > 0 })
+        {
+            Console.WriteLine($"[Dict] Empirical read succeeded: {best.Count} entries.");
+            return best;
+        }
+
+        Console.WriteLine("[Dict] Empirical approach yielded no entries — falling back.");
+        return ReadAttributeDictionaryExhaustive(dictAddr);
+    }
+
+    /// <summary>
+    /// Exhaustive fallback: probes all (count, entries, header, entry-size) combos,
+    /// assuming a standard IL2CPP array header precedes the entry data.
+    /// </summary>
+    private Dictionary<int, double> ReadAttributeDictionaryExhaustive(ulong dictAddr)
+    {
+        // ── find all plausible _count candidates (10..2000) ──────────────────
+        Console.WriteLine("[Dict] Exhaustive probe — scanning +0x10..+0x40 for _count (10..2000):");
         var countCandidates = new List<(uint off, int count)>();
         for (uint off = 0x10; off <= 0x40; off += 4)
         {
@@ -254,8 +386,8 @@ public sealed class CombatantReader
         if (countCandidates.Count == 0)
             Console.WriteLine("  (none found)");
 
-        // ── Step 3: find all valid pointer candidates (potential _entries) ───────
-        Console.WriteLine("[Dict] Probing for valid _entries pointers at +0x10..+0x40:");
+        // ── find all valid pointer candidates (potential _entries) ────────────
+        Console.WriteLine("[Dict] Exhaustive probe — scanning +0x10..+0x40 for valid _entries pointers:");
         var entriesCandidates = new List<(uint off, ulong ptr)>();
         for (uint off = 0x10; off <= 0x40; off += 8)
         {
@@ -269,7 +401,7 @@ public sealed class CombatantReader
         if (entriesCandidates.Count == 0)
             Console.WriteLine("  (none found)");
 
-        // ── Step 4: for each entries pointer, dump its array header ──────────────
+        // ── for each entries pointer, dump its array header ───────────────────
         foreach (var (eOff, entriesPtr) in entriesCandidates)
         {
             Console.WriteLine($"[Dict] Entries array at dict+0x{eOff:X2} = 0x{entriesPtr:X} (first 0x40 bytes):");
@@ -290,13 +422,7 @@ public sealed class CombatantReader
             }
         }
 
-        // ── Step 5: try all (countOff, entriesOff, arrayHeaderSize, entrySize) combos ──
-        //
-        // Array header sizes:
-        //   0x20 = klass(8) + monitor(8) + bounds(8) + max_length(8)  [standard IL2CPP]
-        //   0x18 = klass(8) + monitor(8) + max_length(8)              [compact 1D array]
-        //   0x10 = klass(8) + max_length(8)                           [no-monitor]
-        //
+        // ── try all (countOff, entriesOff, arrayHeaderSize, entrySize) combos ──
         int[] arrayDataOffsets = [0x20, 0x18, 0x10];
         int[] entrySizes       = [16, 20, 24, 28, 32];
 
@@ -307,16 +433,15 @@ public sealed class CombatantReader
         {
             foreach (var (eOff, entriesPtr) in entriesCandidates)
             {
-                if (cOff == eOff) continue; // same offset can't be both count and entries
+                if (cOff == eOff) continue;
 
-                // Determine max_length from the entries array at a few plausible positions.
                 int maxLength = 0;
                 foreach (int mlOff in new[] { 0x18, 0x10, 0x8 })
                 {
                     int ml = _memory.ReadInt32(entriesPtr + (ulong)mlOff);
                     if (ml >= count && ml <= 8192) { maxLength = ml; break; }
                 }
-                if (maxLength == 0) maxLength = count * 2; // fallback — allow any reasonable scan
+                if (maxLength == 0) maxLength = count * 2;
 
                 foreach (int dataOff in arrayDataOffsets)
                 {
@@ -324,10 +449,6 @@ public sealed class CombatantReader
                     {
                         ulong dataStart = entriesPtr + (ulong)dataOff;
 
-                        // For each entry size, try a few (keyOff, valOff) layouts.
-                        // Standard: hashCode(4)+next(4)+key(4)+pad(4)+val(8) => key@+8, val@+16 (24-byte)
-                        // Compact:  hashCode(4)+next(4)+key(4)+val(8)        => key@+8, val@+12 (20-byte, no pad)
-                        // Tight:    hashCode(4)+key(4)+val(8)                => key@+4, val@+8  (16-byte)
                         var keyValLayouts = entrySize switch
                         {
                             16 => new[] { (4, 8) },
@@ -364,7 +485,6 @@ public sealed class CombatantReader
                             {
                                 bestScore = result.Count;
                                 best = result;
-
                                 Console.WriteLine(
                                     $"[Dict] *** Best so far: count@+0x{cOff:X2}={count}, " +
                                     $"entries@+0x{eOff:X2}, data@+0x{dataOff:X}, " +
@@ -377,7 +497,6 @@ public sealed class CombatantReader
             }
         }
 
-        // ── Step 6: fall back to the pre-built Variants if the exhaustive probe failed ──
         if (best == null)
         {
             Console.WriteLine("[Dict] Exhaustive probe found nothing — trying pre-built Variants:");
@@ -406,7 +525,7 @@ public sealed class CombatantReader
                 }
             }
 
-            Console.WriteLine($"[Dict] ReadAttributeDictionary: no variant yielded entries for dict 0x{dictAddr:X}");
+            Console.WriteLine($"[Dict] ReadAttributeDictionary: all probes failed for dict 0x{dictAddr:X}");
             return new Dictionary<int, double>();
         }
 
