@@ -8,14 +8,22 @@ public class InventoryReader
 {
     private readonly ProcessMemory _memory;
     private readonly MemoryRegionScanner _scanner;
-    private ulong _itemVtable;
+    private ulong _itemInfoVtable;
     private readonly string _cacheDir;
     private readonly Dictionary<int, string> _itemDataByTypeId = new();
+    private readonly Dictionary<string, int> _typeIdByName = new();
 
-    public ulong ItemVtable => _itemVtable;
-    public int OffsetItemCode => 0x10;
-    public int OffsetStackCount => 0x1C;
-    public int OffsetInternalNamePtr => 0x20;
+    // ItemInfo field offsets confirmed from live game memory dump ("Councils" item):
+    //   +0x00  vtable (0x221D1E2B610)
+    //   +0x08  sync   (0 for all observed objects)
+    //   +0x10  TypeID (int32; 0 for "Councils" currency — may need name fallback)
+    //   +0x18  StaticName string ptr
+    //   +0x20  unknown int (1 for "Councils")
+    //   Object size: 0x40
+    private const int OffsetItemInfoTypeId     = 0x10;
+    private const int OffsetItemInfoStaticName = 0x18;
+
+    public ulong ItemVtable => _itemInfoVtable;
 
     public InventoryReader(ProcessMemory memory, MemoryRegionScanner scanner)
     {
@@ -44,19 +52,19 @@ public class InventoryReader
                 string suffix = prop.Name.StartsWith("item_") ? prop.Name[5..] : prop.Name;
                 try
                 {
-                    // Pattern 1: key suffix is the numeric TypeID (e.g. "item_12345")
                     if (int.TryParse(suffix, out int keyTypeId))
                     {
                         string internalName = suffix;
                         if (prop.Value.TryGetProperty("InternalName", out var internalNameEl))
                             internalName = internalNameEl.GetString() ?? suffix;
                         _itemDataByTypeId[keyTypeId] = internalName;
+                        _typeIdByName[internalName] = keyTypeId;
                     }
-                    // Pattern 2: key suffix is the name, TypeID is a field inside (e.g. "item_IronSword")
                     else if (prop.Value.TryGetProperty("TypeID", out var typeIdEl))
                     {
                         int typeId = typeIdEl.GetInt32();
                         _itemDataByTypeId[typeId] = suffix;
+                        _typeIdByName[suffix] = typeId;
                     }
                 }
                 catch { }
@@ -75,7 +83,6 @@ public class InventoryReader
         if (File.Exists(primaryPath))
             return primaryPath;
 
-        // Fallback 1: current working directory
         string cwdPath = Path.Combine(Environment.CurrentDirectory, "items.json");
         if (File.Exists(cwdPath))
         {
@@ -83,7 +90,6 @@ public class InventoryReader
             return cwdPath;
         }
 
-        // Fallback 2: walk up from AppContext.BaseDirectory up to 6 levels
         string? dir = AppContext.BaseDirectory;
         for (int i = 0; i < 6; i++)
         {
@@ -102,14 +108,14 @@ public class InventoryReader
 
     public bool AutoDiscover()
     {
-        // Strategy 1 - Cache
+        // Strategy 1 — Cache (key: itemInfoVtable)
         try
         {
             string cachePath = Path.Combine(_cacheDir, "vtable_cache.json");
             if (File.Exists(cachePath))
             {
                 using var doc = JsonDocument.Parse(File.ReadAllText(cachePath));
-                if (doc.RootElement.TryGetProperty("itemVtable", out var el))
+                if (doc.RootElement.TryGetProperty("itemInfoVtable", out var el))
                 {
                     string? hex = el.GetString();
                     if (hex != null)
@@ -117,7 +123,8 @@ public class InventoryReader
                         ulong val = Convert.ToUInt64(hex, 16);
                         if (val > 0x1_0000_0000 && val < 0x7FFF_FFFF_FFFF)
                         {
-                            _itemVtable = val;
+                            _itemInfoVtable = val;
+                            Console.WriteLine($"[InventoryReader] Loaded ItemInfo vtable from cache: 0x{_itemInfoVtable:X}");
                             return true;
                         }
                     }
@@ -126,155 +133,30 @@ public class InventoryReader
         }
         catch { }
 
-        // Strategy 2 - Value-pattern vtable scan (single pass, ~12s)
-        Console.WriteLine("[InventoryReader] AutoDiscover: trying value-pattern vtable scan...");
-        if (DiscoverViaValuePattern())
+        // Strategy 2 — Scan for known ItemInfo vtable (0x221D1E2B610), confirmed from live dump
+        Console.WriteLine("[InventoryReader] AutoDiscover: scanning for known ItemInfo vtable (0x221D1E2B610)...");
+        if (ScanForKnownItemInfoVtable())
             return true;
 
-        // Strategy 3 - Structural via item name (string probing, slow fallback)
-        Console.WriteLine("[InventoryReader] AutoDiscover: falling back to string-probing strategy...");
-        if (_itemDataByTypeId.Count == 0)
-        {
-            // Try to load items.json from common paths before giving up
-            string? autoPath = ResolveItemsJsonPath(Path.Combine(AppContext.BaseDirectory, "items.json"));
-            if (autoPath != null)
-                LoadItemData(autoPath);
-        }
-
-        if (_itemDataByTypeId.Count == 0)
-        {
-            Console.Error.WriteLine("[InventoryReader] AutoDiscover: no item data loaded; skipping structural scan.");
-            return false;
-        }
-
-        string[] candidates = { "IronSword", "Apple", "RedAster", "BasicStaff", "CottonCloth" };
-
-        foreach (string candidate in candidates)
-        {
-            var hits = _scanner.ScanForUtf16String(candidate, maxResults: 30);
-            foreach (var hit in hits)
-            {
-                ulong strObj = hit.Address - 0x14;
-                var ptrs = _scanner.ScanForPointerTo(strObj, maxResults: 20);
-                foreach (var ptrMatch in ptrs)
-                {
-                    ulong itemInfoBase = ptrMatch.Address - 0x20;
-                    int typeId = _memory.ReadInt32(itemInfoBase + 0x10);
-                    if (typeId <= 0 || typeId >= 1_000_000) continue;
-
-                    var itemPtrs = _scanner.ScanForPointerTo(itemInfoBase, maxResults: 20);
-                    foreach (var itemPtr in itemPtrs)
-                    {
-                        ulong itemBase = itemPtr.Address - 0x10;
-                        if (!ValidateItemObject(itemBase)) continue;
-                        _itemVtable = _memory.ReadPointer(itemBase);
-                        SaveVtableCache();
-                        return true;
-                    }
-                }
-            }
-        }
-
+        Console.Error.WriteLine("[InventoryReader] AutoDiscover: ItemInfo vtable not found in process memory.");
         return false;
     }
 
-    private bool DiscoverViaValuePattern()
+    private bool ScanForKnownItemInfoVtable()
     {
-        // Single-pass scan: for each 8-byte aligned offset check all Item field constraints.
-        // Item layout:
-        //   +0x00  vtable pointer (must be in valid range)
-        //   +0x10  ItemInfo* (must be valid pointer)
-        //   +0x18  IID int (must be >0 and <10_000_000)
-        //   +0x1C  StackSize ushort (must be 1..9999)
-        //   +0x20  IsEquipped byte (must be 0 or 1)
-        const int chunkSize   = 8 * 1024 * 1024;
-        const int minRequired = 0x21; // need bytes 0x00..0x20 inclusive
-        var vtableCounts = new Dictionary<ulong, int>();
+        // The ItemInfo vtable was empirically confirmed at 0x221D1E2B610 from a live game dump
+        // of the "Councils" item. Scan for this specific 8-byte value across all game regions.
+        const ulong knownVtable = 0x221D1E2B610UL;
+        const int chunkSize = 8 * 1024 * 1024;
+        const int minRequired = 0x20; // need vtable(8) + sync(8) + typeId(8) + namePtr(8)
+
+        int found = 0;
+        int validated = 0;
 
         foreach (var region in _scanner.GetGameRegions())
         {
             ulong regionOffset = 0;
             while (regionOffset < region.Size)
-            {
-                ulong remaining = region.Size - regionOffset;
-                int readSize = (int)Math.Min(remaining, (ulong)chunkSize);
-                byte[]? chunk = _memory.ReadBytes(region.BaseAddress + regionOffset, readSize);
-                regionOffset += (ulong)readSize;
-
-                if (chunk == null || chunk.Length < minRequired) continue;
-
-                int end = chunk.Length - minRequired;
-                for (int i = 0; i <= end; i += 8)
-                {
-                    ulong vtable = BitConverter.ToUInt64(chunk, i);
-                    if (vtable <= 0x1_0000_0000ul || vtable > 0x7FFF_FFFF_FFFFul) continue;
-
-                    ulong infoPtr = BitConverter.ToUInt64(chunk, i + 0x10);
-                    if (infoPtr <= 0x1_0000_0000ul || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
-
-                    int iid = BitConverter.ToInt32(chunk, i + 0x18);
-                    if (iid <= 0 || iid >= 10_000_000) continue;
-
-                    ushort stackSize = BitConverter.ToUInt16(chunk, i + 0x1C);
-                    if (stackSize < 1 || stackSize > 9999) continue;
-
-                    byte isEquipped = chunk[i + 0x20];
-                    if (isEquipped > 1) continue;
-
-                    vtableCounts.TryGetValue(vtable, out int count);
-                    vtableCounts[vtable] = count + 1;
-                }
-            }
-        }
-
-        if (vtableCounts.Count == 0)
-        {
-            Console.WriteLine("[InventoryReader] ValuePattern: no candidates found.");
-            return false;
-        }
-
-        var sorted = vtableCounts.OrderByDescending(kv => kv.Value).ToList();
-
-        int logCount = Math.Min(10, sorted.Count);
-        Console.WriteLine($"[InventoryReader] ValuePattern: top {logCount} vtable candidates:");
-        for (int i = 0; i < logCount; i++)
-            Console.WriteLine($"  [{i + 1}] 0x{sorted[i].Key:X} — {sorted[i].Value} hits");
-
-        var best = sorted[0];
-        if (best.Value < 3)
-        {
-            Console.WriteLine($"[InventoryReader] ValuePattern: best candidate has only {best.Value} hit(s) (need >=3). Skipping.");
-            return false;
-        }
-
-        ulong candidateVtable = best.Key;
-        Console.WriteLine($"[InventoryReader] ValuePattern: validating vtable 0x{candidateVtable:X} ({best.Value} hits)...");
-
-        if (!ValidateVtableCandidate(candidateVtable))
-        {
-            Console.WriteLine($"[InventoryReader] ValuePattern: vtable 0x{candidateVtable:X} failed TypeID validation.");
-            return false;
-        }
-
-        _itemVtable = candidateVtable;
-        SaveVtableCache();
-        return true;
-    }
-
-    private bool ValidateVtableCandidate(ulong candidateVtable)
-    {
-        // Re-scan to find real instances of this vtable and check ItemInfo->TypeID
-        // against loaded item data. Stops after inspecting 10 objects.
-        const int chunkSize   = 8 * 1024 * 1024;
-        const int minRequired = 0x21;
-        int found   = 0;
-        int matched = 0;
-
-        foreach (var region in _scanner.GetGameRegions())
-        {
-            if (found >= 10) break;
-            ulong regionOffset = 0;
-            while (regionOffset < region.Size && found < 10)
             {
                 ulong remaining = region.Size - regionOffset;
                 int readSize = (int)Math.Min(remaining, (ulong)chunkSize);
@@ -285,44 +167,43 @@ public class InventoryReader
                 if (chunk == null || chunk.Length < minRequired) continue;
 
                 int end = chunk.Length - minRequired;
-                for (int i = 0; i <= end && found < 10; i += 8)
+                for (int i = 0; i <= end; i += 8)
                 {
-                    if (BitConverter.ToUInt64(chunk, i) != candidateVtable) continue;
+                    if (BitConverter.ToUInt64(chunk, i) != knownVtable) continue;
 
                     ulong objAddr = region.BaseAddress + chunkBase + (ulong)i;
-                    ulong infoPtr = _memory.ReadPointer(objAddr + 0x10);
-                    if (infoPtr <= 0x1_0000_0000ul || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
 
-                    int typeId    = _memory.ReadInt32(infoPtr + 0x10);
-                    int iid       = _memory.ReadInt32(objAddr + 0x18);
-                    ushort stack  = _memory.ReadUInt16(objAddr + 0x1C);
-                    byte equipped = _memory.ReadByte(objAddr + 0x20);
+                    // sync at +0x08 should be 0 or very small
+                    ulong sync = _memory.ReadPointer(objAddr + 0x08);
+                    if (sync > 0xFF) continue;
+
+                    // StaticName ptr at +0x18 must be valid
+                    ulong namePtr = _memory.ReadPointer(objAddr + OffsetItemInfoStaticName);
+                    if (namePtr <= 0x1_0000_0000ul || namePtr > 0x7FFF_FFFF_FFFFul) continue;
+
+                    string? name = _memory.ReadMonoString(namePtr, maxLength: 128);
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    int typeId = _memory.ReadInt32(objAddr + OffsetItemInfoTypeId);
+                    bool knownType = _itemDataByTypeId.ContainsKey(typeId);
 
                     found++;
-                    bool knownType = _itemDataByTypeId.ContainsKey(typeId);
-                    if (knownType) matched++;
+                    validated++;
 
-                    Console.WriteLine($"  [Item {found}] addr=0x{objAddr:X} iid={iid} typeId={typeId} stack={stack} equipped={equipped} known={knownType}");
+                    if (found <= 10)
+                        Console.WriteLine($"  [ItemInfo {found}] addr=0x{objAddr:X} typeId={typeId} name=\"{name}\" known={knownType}");
                 }
             }
         }
 
-        Console.WriteLine($"[InventoryReader] ValuePattern: {matched}/{found} items matched known TypeIDs.");
-        return matched > 0;
-    }
+        Console.WriteLine($"[InventoryReader] ItemInfoScan: found {validated} validated ItemInfo objects with vtable 0x{knownVtable:X}.");
 
-    private bool ValidateItemObject(ulong addr)
-    {
-        ulong vtable = _memory.ReadPointer(addr);
-        if (vtable <= 0x1_0000_0000ul || vtable > 0x7FFF_FFFF_FFFF) return false;
+        if (validated == 0)
+            return false;
 
-        int iid = _memory.ReadInt32(addr + 0x18);
-        ushort stackSize = _memory.ReadUInt16(addr + 0x1C);
-        ulong infoPtr = _memory.ReadPointer(addr + 0x10);
-
-        return iid > 0
-            && stackSize >= 1 && stackSize <= 9999
-            && infoPtr > 0x1_0000_0000ul && infoPtr < 0x7FFF_FFFF_FFFF;
+        _itemInfoVtable = knownVtable;
+        SaveVtableCache();
+        return true;
     }
 
     private void SaveVtableCache()
@@ -345,15 +226,16 @@ public class InventoryReader
                 catch { }
             }
 
-            dict["itemVtable"] = $"0x{_itemVtable:X}";
+            dict["itemInfoVtable"] = $"0x{_itemInfoVtable:X}";
             File.WriteAllText(cachePath, JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true }));
+            Console.WriteLine($"[InventoryReader] Cached ItemInfo vtable 0x{_itemInfoVtable:X} → {cachePath}");
         }
         catch { }
     }
 
     public List<InventoryItemSnapshot>? ReadAllItems()
     {
-        if (_itemVtable == 0) return null;
+        if (_itemInfoVtable == 0) return null;
 
         var results = new List<InventoryItemSnapshot>();
         var seen = new HashSet<ulong>();
@@ -370,39 +252,54 @@ public class InventoryReader
                 byte[]? chunk = _memory.ReadBytes(region.BaseAddress + regionOffset, readSize);
                 regionOffset += (ulong)readSize;
 
-                if (chunk == null) continue;
+                if (chunk == null || chunk.Length < 0x20) continue;
 
-                for (int i = 0; i <= chunk.Length - 8; i += 8)
+                int end = chunk.Length - 0x20;
+                for (int i = 0; i <= end; i += 8)
                 {
-                    if (BitConverter.ToUInt64(chunk, i) != _itemVtable) continue;
+                    if (BitConverter.ToUInt64(chunk, i) != _itemInfoVtable) continue;
 
                     ulong objAddr = region.BaseAddress + chunkBase + (ulong)i;
                     if (seen.Contains(objAddr)) continue;
                     seen.Add(objAddr);
 
-                    if (!ValidateItemObject(objAddr)) continue;
+                    // Validate sync
+                    ulong sync = _memory.ReadPointer(objAddr + 0x08);
+                    if (sync > 0xFF) continue;
 
-                    ulong infoPtr = _memory.ReadPointer(objAddr + 0x10);
-                    int typeId = _memory.ReadInt32(infoPtr + 0x10);
-                    ushort stackSize = _memory.ReadUInt16(objAddr + 0x1C);
-                    byte folderIdx = _memory.ReadByte(objAddr + 0x1F);
-                    bool isEquipped = _memory.ReadBool(objAddr + 0x20);
-                    ulong namePtr = _memory.ReadPointer(infoPtr + 0x20);
-                    string internalName = _memory.ReadMonoString(namePtr)
-                        ?? _itemDataByTypeId.GetValueOrDefault(typeId, $"item_{typeId}");
+                    // Read StaticName
+                    ulong namePtr = _memory.ReadPointer(objAddr + OffsetItemInfoStaticName);
+                    if (namePtr <= 0x1_0000_0000ul || namePtr > 0x7FFF_FFFF_FFFFul) continue;
+
+                    string? staticName = _memory.ReadMonoString(namePtr, maxLength: 128);
+                    if (string.IsNullOrEmpty(staticName)) continue;
+
+                    // Read TypeID; fall back to name lookup for currency/special items (TypeID==0)
+                    int typeId = _memory.ReadInt32(objAddr + OffsetItemInfoTypeId);
+                    if ((typeId <= 0 || !_itemDataByTypeId.ContainsKey(typeId))
+                        && _typeIdByName.TryGetValue(staticName, out int lookedUp))
+                    {
+                        typeId = lookedUp;
+                    }
+
+                    string internalName = _itemDataByTypeId.GetValueOrDefault(typeId, staticName);
 
                     results.Add(new InventoryItemSnapshot
                     {
                         ObjectAddress = objAddr,
-                        ItemCode = typeId,
-                        StackCount = stackSize,
-                        InternalName = internalName,
-                        IsEquipped = isEquipped,
-                        FolderIdx = folderIdx
+                        ItemCode      = typeId,
+                        StackCount    = 1,       // ItemInfo has no stack count; Item wrapper needed
+                        InternalName  = internalName,
+                        IsEquipped    = false,   // ItemInfo has no equipped flag; Item wrapper needed
+                        FolderIdx     = 0
                     });
                 }
             }
         }
+
+        Console.WriteLine($"[InventoryReader] ReadAllItems: found {results.Count} ItemInfo objects.");
+        if (results.Count > 0)
+            Console.WriteLine("[InventoryReader] WARNING: StackCount and IsEquipped default to 1/false — Item wrapper objects not located yet.");
 
         return results.OrderBy(i => i.InternalName).ToList();
     }
