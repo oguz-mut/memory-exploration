@@ -56,7 +56,7 @@ public sealed class SkillReader
                      && ulong.TryParse(hex.Replace("0x", ""), System.Globalization.NumberStyles.HexNumber, null, out ulong cached)
                      && int.TryParse(offHex.Replace("0x", ""), System.Globalization.NumberStyles.HexNumber, null, out int cachedOff))
                     {
-                        if (cached > 0x10000)
+                        if (cached > 0x1_0000_0000)
                         {
                             _rawLevelOffset = cachedOff;
                             if (ValidateSkillVtable(cached))
@@ -95,7 +95,7 @@ public sealed class SkillReader
                     for (int i = 0; i + 0x2C <= chunk.Length; i += 8)
                     {
                         ulong vtable = BitConverter.ToUInt64(chunk, i);
-                        if (vtable <= 0x10000 || vtable > 0x7FFF_FFFF_FFFFul) continue;
+                        if (vtable <= 0x1_0000_0000ul || vtable > 0x7FFF_FFFF_FFFFul) continue;
 
                         // Pattern A: rawLevel=+0x14, bonusLevel=+0x18, xpToNext=+0x20, maxRaw=+0x24
                         int rawA = BitConverter.ToInt32(chunk, i + 0x14);

@@ -115,7 +115,7 @@ public class InventoryReader
                     if (hex != null)
                     {
                         ulong val = Convert.ToUInt64(hex, 16);
-                        if (val > 0x10000 && val < 0x7FFF_FFFF_FFFF)
+                        if (val > 0x1_0000_0000 && val < 0x7FFF_FFFF_FFFF)
                         {
                             _itemVtable = val;
                             return true;
@@ -207,10 +207,10 @@ public class InventoryReader
                 for (int i = 0; i <= end; i += 8)
                 {
                     ulong vtable = BitConverter.ToUInt64(chunk, i);
-                    if (vtable < 0x10000 || vtable > 0x7FFF_FFFF_FFFFul) continue;
+                    if (vtable <= 0x1_0000_0000ul || vtable > 0x7FFF_FFFF_FFFFul) continue;
 
                     ulong infoPtr = BitConverter.ToUInt64(chunk, i + 0x10);
-                    if (infoPtr < 0x10000 || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
+                    if (infoPtr <= 0x1_0000_0000ul || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
 
                     int iid = BitConverter.ToInt32(chunk, i + 0x18);
                     if (iid <= 0 || iid >= 10_000_000) continue;
@@ -291,7 +291,7 @@ public class InventoryReader
 
                     ulong objAddr = region.BaseAddress + chunkBase + (ulong)i;
                     ulong infoPtr = _memory.ReadPointer(objAddr + 0x10);
-                    if (infoPtr < 0x10000 || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
+                    if (infoPtr <= 0x1_0000_0000ul || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
 
                     int typeId    = _memory.ReadInt32(infoPtr + 0x10);
                     int iid       = _memory.ReadInt32(objAddr + 0x18);
@@ -314,7 +314,7 @@ public class InventoryReader
     private bool ValidateItemObject(ulong addr)
     {
         ulong vtable = _memory.ReadPointer(addr);
-        if (vtable < 0x10000 || vtable > 0x7FFF_FFFF_FFFF) return false;
+        if (vtable <= 0x1_0000_0000ul || vtable > 0x7FFF_FFFF_FFFF) return false;
 
         int iid = _memory.ReadInt32(addr + 0x18);
         ushort stackSize = _memory.ReadUInt16(addr + 0x1C);
@@ -322,7 +322,7 @@ public class InventoryReader
 
         return iid > 0
             && stackSize >= 1 && stackSize <= 9999
-            && infoPtr > 0x10000 && infoPtr < 0x7FFF_FFFF_FFFF;
+            && infoPtr > 0x1_0000_0000ul && infoPtr < 0x7FFF_FFFF_FFFF;
     }
 
     private void SaveVtableCache()
@@ -420,7 +420,7 @@ public class InventoryReader
             float f32 = _memory.ReadFloat(fieldAddr);
             ulong ptr = _memory.ReadPointer(fieldAddr);
             string extra = "";
-            if (ptr > 0x10000 && ptr < 0x7FFF_FFFF_FFFF)
+            if (ptr > 0x1_0000_0000ul && ptr < 0x7FFF_FFFF_FFFF)
             {
                 string? s = _memory.ReadMonoString(ptr, maxLength: 64);
                 extra = s != null ? $"-> \"{s}\"" : $"-> 0x{ptr:X}";
