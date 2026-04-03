@@ -10,7 +10,7 @@ class MCTSSolver : ISolver
 {
     private const double UCB1_C      = 1.41;        // exploration constant sqrt(2)
     private const double EPSILON     = 0.15;        // fraction of random (exploration) playout moves
-    private const int    BONUS_MULTI = 5;           // multiplier for moves creating 4+ matches
+    private const int    BONUS_MULTI = 8;           // multiplier for moves creating 4+ matches (compounds)
 
     /// <summary>
     /// Solve using MCTS: exact first cascade (real PRNG clone), then UCB1-guided
@@ -290,9 +290,9 @@ class MCTSSolver : ISolver
         int baseLine    = playout.Score;
         int currentTier = playout.Tier;
 
-        // Extra turns are more valuable when turns are scarce
+        // Extra turns are more valuable when turns are scarce — tripled at end of game
         int effectiveExtraTurnBonus = playout.TurnsRemaining <= 3
-            ? extraTurnBonus * 2
+            ? extraTurnBonus * 3
             : extraTurnBonus;
 
         for (int i = 0; i < sampleSize; i++)
