@@ -126,7 +126,13 @@ public class InventoryReader
         }
         catch { }
 
-        // Strategy 2 - Structural via item name
+        // Strategy 2 - Value-pattern vtable scan (single pass, ~12s)
+        Console.WriteLine("[InventoryReader] AutoDiscover: trying value-pattern vtable scan...");
+        if (DiscoverViaValuePattern())
+            return true;
+
+        // Strategy 3 - Structural via item name (string probing, slow fallback)
+        Console.WriteLine("[InventoryReader] AutoDiscover: falling back to string-probing strategy...");
         if (_itemDataByTypeId.Count == 0)
         {
             // Try to load items.json from common paths before giving up
@@ -170,6 +176,139 @@ public class InventoryReader
         }
 
         return false;
+    }
+
+    private bool DiscoverViaValuePattern()
+    {
+        // Single-pass scan: for each 8-byte aligned offset check all Item field constraints.
+        // Item layout:
+        //   +0x00  vtable pointer (must be in valid range)
+        //   +0x10  ItemInfo* (must be valid pointer)
+        //   +0x18  IID int (must be >0 and <10_000_000)
+        //   +0x1C  StackSize ushort (must be 1..9999)
+        //   +0x20  IsEquipped byte (must be 0 or 1)
+        const int chunkSize   = 8 * 1024 * 1024;
+        const int minRequired = 0x21; // need bytes 0x00..0x20 inclusive
+        var vtableCounts = new Dictionary<ulong, int>();
+
+        foreach (var region in _scanner.GetGameRegions())
+        {
+            ulong regionOffset = 0;
+            while (regionOffset < region.Size)
+            {
+                ulong remaining = region.Size - regionOffset;
+                int readSize = (int)Math.Min(remaining, (ulong)chunkSize);
+                byte[]? chunk = _memory.ReadBytes(region.BaseAddress + regionOffset, readSize);
+                regionOffset += (ulong)readSize;
+
+                if (chunk == null || chunk.Length < minRequired) continue;
+
+                int end = chunk.Length - minRequired;
+                for (int i = 0; i <= end; i += 8)
+                {
+                    ulong vtable = BitConverter.ToUInt64(chunk, i);
+                    if (vtable < 0x10000 || vtable > 0x7FFF_FFFF_FFFFul) continue;
+
+                    ulong infoPtr = BitConverter.ToUInt64(chunk, i + 0x10);
+                    if (infoPtr < 0x10000 || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
+
+                    int iid = BitConverter.ToInt32(chunk, i + 0x18);
+                    if (iid <= 0 || iid >= 10_000_000) continue;
+
+                    ushort stackSize = BitConverter.ToUInt16(chunk, i + 0x1C);
+                    if (stackSize < 1 || stackSize > 9999) continue;
+
+                    byte isEquipped = chunk[i + 0x20];
+                    if (isEquipped > 1) continue;
+
+                    vtableCounts.TryGetValue(vtable, out int count);
+                    vtableCounts[vtable] = count + 1;
+                }
+            }
+        }
+
+        if (vtableCounts.Count == 0)
+        {
+            Console.WriteLine("[InventoryReader] ValuePattern: no candidates found.");
+            return false;
+        }
+
+        var sorted = vtableCounts.OrderByDescending(kv => kv.Value).ToList();
+
+        int logCount = Math.Min(10, sorted.Count);
+        Console.WriteLine($"[InventoryReader] ValuePattern: top {logCount} vtable candidates:");
+        for (int i = 0; i < logCount; i++)
+            Console.WriteLine($"  [{i + 1}] 0x{sorted[i].Key:X} — {sorted[i].Value} hits");
+
+        var best = sorted[0];
+        if (best.Value < 3)
+        {
+            Console.WriteLine($"[InventoryReader] ValuePattern: best candidate has only {best.Value} hit(s) (need >=3). Skipping.");
+            return false;
+        }
+
+        ulong candidateVtable = best.Key;
+        Console.WriteLine($"[InventoryReader] ValuePattern: validating vtable 0x{candidateVtable:X} ({best.Value} hits)...");
+
+        if (!ValidateVtableCandidate(candidateVtable))
+        {
+            Console.WriteLine($"[InventoryReader] ValuePattern: vtable 0x{candidateVtable:X} failed TypeID validation.");
+            return false;
+        }
+
+        _itemVtable = candidateVtable;
+        SaveVtableCache();
+        return true;
+    }
+
+    private bool ValidateVtableCandidate(ulong candidateVtable)
+    {
+        // Re-scan to find real instances of this vtable and check ItemInfo->TypeID
+        // against loaded item data. Stops after inspecting 10 objects.
+        const int chunkSize   = 8 * 1024 * 1024;
+        const int minRequired = 0x21;
+        int found   = 0;
+        int matched = 0;
+
+        foreach (var region in _scanner.GetGameRegions())
+        {
+            if (found >= 10) break;
+            ulong regionOffset = 0;
+            while (regionOffset < region.Size && found < 10)
+            {
+                ulong remaining = region.Size - regionOffset;
+                int readSize = (int)Math.Min(remaining, (ulong)chunkSize);
+                ulong chunkBase = regionOffset;
+                byte[]? chunk = _memory.ReadBytes(region.BaseAddress + regionOffset, readSize);
+                regionOffset += (ulong)readSize;
+
+                if (chunk == null || chunk.Length < minRequired) continue;
+
+                int end = chunk.Length - minRequired;
+                for (int i = 0; i <= end && found < 10; i += 8)
+                {
+                    if (BitConverter.ToUInt64(chunk, i) != candidateVtable) continue;
+
+                    ulong objAddr = region.BaseAddress + chunkBase + (ulong)i;
+                    ulong infoPtr = _memory.ReadPointer(objAddr + 0x10);
+                    if (infoPtr < 0x10000 || infoPtr > 0x7FFF_FFFF_FFFFul) continue;
+
+                    int typeId    = _memory.ReadInt32(infoPtr + 0x10);
+                    int iid       = _memory.ReadInt32(objAddr + 0x18);
+                    ushort stack  = _memory.ReadUInt16(objAddr + 0x1C);
+                    byte equipped = _memory.ReadByte(objAddr + 0x20);
+
+                    found++;
+                    bool knownType = _itemDataByTypeId.ContainsKey(typeId);
+                    if (knownType) matched++;
+
+                    Console.WriteLine($"  [Item {found}] addr=0x{objAddr:X} iid={iid} typeId={typeId} stack={stack} equipped={equipped} known={knownType}");
+                }
+            }
+        }
+
+        Console.WriteLine($"[InventoryReader] ValuePattern: {matched}/{found} items matched known TypeIDs.");
+        return matched > 0;
     }
 
     private bool ValidateItemObject(ulong addr)
