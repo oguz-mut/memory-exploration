@@ -31,6 +31,9 @@ public sealed class SkillReader
     // Minimum bytes needed from object base to read all fields (0x68 + 4 bytes for int32)
     private const int MinSpan = OffMax + 4; // 0x6C
 
+    // Mono string chars start at +0x14 (vtable 8 + sync 8 + length 4 = 0x14)
+    private const int MonoStringCharsOffset = 0x14;
+
     public SkillReader(ProcessMemory memory, MemoryRegionScanner scanner)
     {
         _memory = memory;
@@ -42,7 +45,7 @@ public sealed class SkillReader
 
     public bool AutoDiscover()
     {
-        // Strategy 1 — Cache
+        // Strategy 1 — Cache (re-validate before using; vtables change across ASLR restarts)
         try
         {
             string cachePath = Path.Combine(_cacheDir, "vtable_cache.json");
@@ -62,21 +65,103 @@ public sealed class SkillReader
                             Console.WriteLine($"[SkillReader] Loaded vtable from cache: 0x{_skillVtable:X}");
                             return true;
                         }
+                        Console.WriteLine($"[SkillReader] Cached vtable 0x{cached:X} failed validation (ASLR restart?), re-discovering.");
                     }
                 }
             }
         }
         catch { }
 
-        // Strategy 2 — Empirical structural scan
-        // Single-pass over all private regions. For every 8-byte-aligned offset i:
-        //   • vtable  at i+0x00 must be a valid pointer
-        //   • strPtr  at i+0x40 must be a valid pointer
-        //   • level   at i+0x50 must be 0..200
-        //   • max     at i+0x68 must be 1..200, and level <= max
-        // Group candidates by vtable; the most common vtable with >= 3 hits wins.
-        Console.WriteLine("[SkillReader] Starting empirical vtable discovery scan...");
-        var vtableCandidates = new Dictionary<ulong, List<ulong>>(); // vtable → object addresses
+        // Strategy 2 — Phase A: string-trace discovery (~30s).
+        // Scan for "Cooking" UTF-16 chars, trace back to the Mono string object,
+        // then find pointers to that object and derive the skill vtable.
+        // This is ASLR-safe because we start from the string content itself.
+        Console.WriteLine("[SkillReader] Phase A: string-trace discovery via 'Cooking'...");
+        ulong phaseAVtable = PhaseAStringTrace();
+        if (phaseAVtable != 0)
+        {
+            _skillVtable = phaseAVtable;
+            Console.WriteLine($"[SkillReader] Phase A succeeded: vtable=0x{_skillVtable:X}");
+            SaveVtableCache();
+            return true;
+        }
+
+        // Strategy 3 — Phase B: value-pattern scan with per-candidate string validation (~12s).
+        // Falls back when "Cooking" skill is not active (character hasn't trained it, etc.).
+        // Validates top 10 vtable candidates with real Mono string reads to reject false positives
+        // like 0x6400000064 (int pair 100,100 misread as a vtable).
+        Console.WriteLine("[SkillReader] Phase B: value-pattern scan with inline string validation...");
+        ulong phaseBVtable = PhaseBValueScan();
+        if (phaseBVtable != 0)
+        {
+            _skillVtable = phaseBVtable;
+            Console.WriteLine($"[SkillReader] Phase B succeeded: vtable=0x{_skillVtable:X}");
+            SaveVtableCache();
+            return true;
+        }
+
+        Console.WriteLine("[SkillReader] All discovery strategies failed.");
+        return false;
+    }
+
+    // Phase A: trace "Cooking" UTF-16 bytes → Mono string object → pointer to object → skill object → vtable.
+    private ulong PhaseAStringTrace()
+    {
+        var stringHits = _scanner.ScanForUtf16String("Cooking", maxResults: 10);
+        Console.WriteLine($"[SkillReader] Phase A: {stringHits.Count} UTF-16 'Cooking' hit(s) in memory");
+
+        foreach (var hit in stringHits)
+        {
+            // ScanForUtf16String returns the address of the raw chars.
+            // Mono string layout: vtable(8) + sync(8) + length(4) + chars at +0x14
+            // So Mono string object base = charAddr - 0x14
+            ulong strObjAddr = hit.Address - MonoStringCharsOffset;
+            if (!IsValidPointer(strObjAddr)) continue;
+
+            string? name = _memory.ReadMonoString(strObjAddr, maxLength: 64);
+            if (name != "Cooking")
+            {
+                Console.WriteLine($"[SkillReader] Phase A: 0x{strObjAddr:X} is not a Mono 'Cooking' string (got \"{name}\"), skipping");
+                continue;
+            }
+
+            Console.WriteLine($"[SkillReader] Phase A: valid Mono 'Cooking' string at 0x{strObjAddr:X}");
+
+            // Find all pointers to this Mono string object in memory
+            var ptrs = _scanner.ScanForPointerTo(strObjAddr, maxResults: 10);
+            Console.WriteLine($"[SkillReader] Phase A: {ptrs.Count} pointer(s) to string object 0x{strObjAddr:X}");
+
+            foreach (var ptr in ptrs)
+            {
+                // The name field is at objBase + 0x40, so objBase = ptr.Address - 0x40
+                ulong objBase = ptr.Address - OffNamePtr;
+
+                ulong vtable = _memory.ReadPointer(objBase);
+                if (!IsValidPointer(vtable)) continue;
+
+                int level = _memory.ReadInt32(objBase + OffLevel);
+                if (level < 0 || level > 200) continue;
+
+                int max = _memory.ReadInt32(objBase + OffMax);
+                if (max < 1 || max > 200) continue;
+
+                Console.WriteLine(
+                    $"[SkillReader] Phase A: skill obj=0x{objBase:X} vtable=0x{vtable:X} " +
+                    $"level={level} max={max} name=\"Cooking\"");
+                return vtable;
+            }
+        }
+
+        Console.WriteLine("[SkillReader] Phase A: no valid skill object found via string trace.");
+        return 0;
+    }
+
+    // Phase B: chunk scan collecting vtable candidates, then validate top 10 by reading actual
+    // Mono strings. Requires >= 3 valid skill names per candidate to accept it.
+    // This prevents false positives like 0x6400000064 (100,100 int pair) from winning.
+    private ulong PhaseBValueScan()
+    {
+        var vtableCandidates = new Dictionary<ulong, List<ulong>>();
 
         foreach (var region in _scanner.GetGameRegions())
         {
@@ -95,6 +180,7 @@ public sealed class SkillReader
                         ulong vtable = BitConverter.ToUInt64(chunk, i);
                         if (!IsValidPointer(vtable)) continue;
 
+                        // Inline: strPtr at +0x40 must also look like a valid pointer
                         ulong strPtr = BitConverter.ToUInt64(chunk, i + OffNamePtr);
                         if (!IsValidPointer(strPtr)) continue;
 
@@ -120,50 +206,46 @@ public sealed class SkillReader
             }
         }
 
-        // Pick the vtable with the most structural hits (minimum 3)
-        ulong bestVtable = 0;
-        List<ulong>? bestAddrs = null;
-        foreach (var (vtable, addrs) in vtableCandidates)
+        // Test top 10 candidates by structural hit count.
+        // Must read actual Mono strings to reject false positives — structural checks alone
+        // are not enough (e.g., 0x6400000064 passes all numeric checks with 1.2M false hits).
+        var topCandidates = vtableCandidates
+            .Where(kv => kv.Value.Count >= 3)
+            .OrderByDescending(kv => kv.Value.Count)
+            .Take(10)
+            .ToList();
+
+        Console.WriteLine($"[SkillReader] Phase B: {topCandidates.Count} vtable candidate(s) with >= 3 structural hits");
+
+        foreach (var (vtable, addrs) in topCandidates)
         {
-            if (addrs.Count >= 3 && (bestAddrs == null || addrs.Count > bestAddrs.Count))
+            Console.WriteLine($"[SkillReader] Phase B: testing vtable 0x{vtable:X} ({addrs.Count} structural hits)");
+            int validated = 0;
+            foreach (ulong objAddr in addrs.Take(20))
             {
-                bestVtable = vtable;
-                bestAddrs = addrs;
+                ulong strPtr = _memory.ReadPointer(objAddr + OffNamePtr);
+                string? name = _memory.ReadMonoString(strPtr, maxLength: 64);
+                if (IsSkillName(name))
+                {
+                    Console.WriteLine($"[SkillReader] Phase B: valid obj=0x{objAddr:X} name=\"{name}\"");
+                    validated++;
+                    if (validated >= 3)
+                    {
+                        Console.WriteLine($"[SkillReader] Phase B: vtable 0x{vtable:X} accepted ({validated} valid names)");
+                        return vtable;
+                    }
+                }
             }
+            Console.WriteLine($"[SkillReader] Phase B: vtable 0x{vtable:X} rejected ({validated}/3 valid names)");
         }
 
-        if (bestVtable == 0 || bestAddrs == null)
-        {
-            Console.WriteLine("[SkillReader] Empirical scan found no vtable with >= 3 structural hits.");
-            return false;
-        }
-
-        Console.WriteLine($"[SkillReader] Best vtable candidate: 0x{bestVtable:X} ({bestAddrs.Count} hits)");
-
-        // Validate by reading the skill name string from a few instances
-        int validated = 0;
-        foreach (ulong objAddr in bestAddrs.Take(10))
-        {
-            ulong strPtr = _memory.ReadPointer(objAddr + OffNamePtr);
-            string? name = _memory.ReadMonoString(strPtr, maxLength: 64);
-            if (!string.IsNullOrEmpty(name) && name.All(c => char.IsLetterOrDigit(c) || c == ' '))
-            {
-                Console.WriteLine($"[SkillReader] Validated obj 0x{objAddr:X}: name=\"{name}\"");
-                validated++;
-                if (validated >= 3) break;
-            }
-        }
-
-        if (validated == 0)
-        {
-            Console.WriteLine("[SkillReader] Vtable candidate failed name validation.");
-            return false;
-        }
-
-        _skillVtable = bestVtable;
-        SaveVtableCache();
-        return true;
+        return 0;
     }
+
+    // Skill names are short ASCII words/phrases: "Cooking", "Sword", "Fire Magic", etc.
+    private static bool IsSkillName(string? name) =>
+        name != null && name.Length >= 3 && name.Length <= 30 &&
+        name.All(c => c < 128 && (char.IsLetterOrDigit(c) || c == ' '));
 
     private static bool IsValidPointer(ulong ptr) =>
         ptr > 0x1_0000_0000UL && ptr < 0x7FFF_FFFF_FFFFul;
@@ -204,7 +286,7 @@ public sealed class SkillReader
                             ulong objAddr = readAddr + (ulong)i;
                             string? name = _memory.ReadMonoString(
                                 _memory.ReadPointer(objAddr + OffNamePtr), maxLength: 64);
-                            if (!string.IsNullOrEmpty(name))
+                            if (IsSkillName(name))
                                 return true;
                         }
                     }
