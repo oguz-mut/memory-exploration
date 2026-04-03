@@ -4,7 +4,7 @@ using MemoryLib.Models;
 
 namespace MemoryLib.Readers;
 
-class EffectReader
+public class EffectReader
 {
     private readonly ProcessMemory _memory;
     private readonly MemoryRegionScanner _scanner;

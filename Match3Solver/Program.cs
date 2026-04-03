@@ -446,9 +446,9 @@ void LoadAutoloopCalibration()
             gctx.UseClickX = doc.RootElement.GetProperty("useX").GetInt32();
             gctx.UseClickY = doc.RootElement.GetProperty("useY").GetInt32();
             gctx.PlayClickX = doc.RootElement.GetProperty("playX").GetInt32();
-            _playClickY = doc.RootElement.GetProperty("playY").GetInt32();
+            gctx.PlayClickY = doc.RootElement.GetProperty("playY").GetInt32();
             gctx.AutoloopCalibrated = true;
-            Console.WriteLine($"[autoloop] Loaded click positions: OK=({gctx.OkClickX},{gctx.OkClickY}) Use=({gctx.UseClickX},{gctx.UseClickY}) Play=({gctx.PlayClickX},{_playClickY})");
+            Console.WriteLine($"[autoloop] Loaded click positions: OK=({gctx.OkClickX},{gctx.OkClickY}) Use=({gctx.UseClickX},{gctx.UseClickY}) Play=({gctx.PlayClickX},{gctx.PlayClickY})");
         }
         catch { }
     }
@@ -477,14 +477,14 @@ void CalibrateAutoloop()
     Console.WriteLine("Step 3: Click the PLAY GAME button on the dialog panel.");
     Console.Write("  Waiting for your click... ");
     var play = GameAutoPlayer.WaitForClick();
-    gctx.PlayClickX = play.X; _playClickY = play.Y;
+    gctx.PlayClickX = play.X; gctx.PlayClickY = play.Y;
     Console.WriteLine($"Play at ({play.X},{play.Y})");
 
     gctx.AutoloopCalibrated = true;
 
     // Save
     Directory.CreateDirectory(settingsDir);
-    var json = $"{{\"okX\":{gctx.OkClickX},\"okY\":{gctx.OkClickY},\"useX\":{gctx.UseClickX},\"useY\":{gctx.UseClickY},\"playX\":{gctx.PlayClickX},\"playY\":{_playClickY}}}";
+    var json = $"{{\"okX\":{gctx.OkClickX},\"okY\":{gctx.OkClickY},\"useX\":{gctx.UseClickX},\"useY\":{gctx.UseClickY},\"playX\":{gctx.PlayClickX},\"playY\":{gctx.PlayClickY}}}";
     File.WriteAllText(Path.Combine(settingsDir, "autoloop_clicks.json"), json);
     Console.WriteLine("[autoloop] Calibration saved! Will reuse next time.");
     Console.WriteLine();
@@ -514,8 +514,8 @@ async Task AutoStartNewGame(CancellationToken ct)
     await Task.Delay(2000);
 
     // Step 3: Click Play Game
-    Console.WriteLine($"[autoloop] Clicking Play at ({gctx.PlayClickX},{_playClickY})");
-    GameAutoPlayer.ClickAt(gctx.PlayClickX, _playClickY);
+    Console.WriteLine($"[autoloop] Clicking Play at ({gctx.PlayClickX},{gctx.PlayClickY})");
+    GameAutoPlayer.ClickAt(gctx.PlayClickX, gctx.PlayClickY);
 
     // Step 4: Wait for ProcessMatch3Start in log
     gctx.NewGameSignal = new TaskCompletionSource<bool>();
@@ -529,7 +529,7 @@ async Task AutoStartNewGame(CancellationToken ct)
         await Task.Delay(300);
         GameAutoPlayer.ClickAt(gctx.UseClickX, gctx.UseClickY);
         await Task.Delay(2000);
-        GameAutoPlayer.ClickAt(gctx.PlayClickX, _playClickY);
+        GameAutoPlayer.ClickAt(gctx.PlayClickX, gctx.PlayClickY);
 
         gctx.NewGameSignal = new TaskCompletionSource<bool>();
         timeoutTask = Task.Delay(10000, ct);
@@ -577,20 +577,19 @@ ProcessMemory? EnsureGameConnection()
         Console.WriteLine("[!] Game process not found");
         return null;
     }
-    _memScanner.InvalidateRegionCache();
+    _memScanner.InvalidateCache();
 
-    // Helpers for nullable reads
-    int ri32(ulong addr) => mem.ReadInt32(addr) ?? throw new Exception($"Read failed at 0x{addr:X}");
-    long ri64(ulong addr) => mem.ReadInt64(addr) ?? throw new Exception($"Read failed at 0x{addr:X}");
-    ulong rptr(ulong addr) => mem.ReadPointer(addr) ?? throw new Exception($"Read failed at 0x{addr:X}");
+    int ri32(ulong addr) => mem.ReadInt32(addr);
+    long ri64(ulong addr) => mem.ReadInt64(addr);
+    ulong rptr(ulong addr) => mem.ReadPointer(addr);
 
     // Step 1: Scan for RandomSeed value in memory (with retry — game may still be allocating)
     var seedBytes = BitConverter.GetBytes(config.RandomSeed);
     List<MemoryLib.Models.ScanMatch> seedHits = new();
     for (int attempt = 0; attempt < 3; attempt++)
     {
-        _memScanner.InvalidateRegionCache();
-        seedHits = _memScanner.ScanForBytePattern(seedBytes, maxResults: 200);
+        _memScanner.InvalidateCache();
+        seedHits = _memScanner.ScanForBytePattern(seedBytes, null, 200);
         Console.WriteLine($"[*] Attempt {attempt + 1}: Found {seedHits.Count} RandomSeed hits in Private regions");
         if (seedHits.Count > 0) break;
         Thread.Sleep(1500); // wait for game to allocate objects
@@ -599,29 +598,29 @@ ProcessMemory? EnsureGameConnection()
     if (seedHits.Count == 0)
     {
         // Broaden search to ALL readable regions
-        var allRegions = mem.EnumerateRegions().Where(r => r.IsReadable && r.Size > 4096).ToList();
+        var allRegions = _memScanner.GetGameRegions().Where(r => r.Size > 4096).ToList();
         Console.WriteLine($"[*] Broadening search to {allRegions.Count} readable regions (was Private-only)");
         long totalScanned = 0;
         foreach (var region in allRegions)
         {
-            long offset = 0;
-            while (offset < (long)region.Size)
+            ulong offset = 0;
+            while (offset < region.Size)
             {
-                int toRead = (int)Math.Min((long)region.Size - offset, 8 * 1024 * 1024);
-                var buf = new byte[toRead];
-                int read = mem.ReadBytes(region.BaseAddress + (ulong)offset, buf, toRead);
-                if (read < 4) break;
+                int toRead = (int)Math.Min((long)(region.Size - offset), 8 * 1024 * 1024);
+                var buf = mem.ReadBytes(region.BaseAddress + offset, toRead);
+                if (buf == null || buf.Length < 4) break;
+                int read = buf.Length;
                 totalScanned += read;
                 for (int i = 0; i <= read - 4; i++)
                 {
                     if (buf[i] == seedBytes[0] && buf[i + 1] == seedBytes[1] &&
                         buf[i + 2] == seedBytes[2] && buf[i + 3] == seedBytes[3])
                     {
-                        ulong addr = region.BaseAddress + (ulong)offset + (ulong)i;
-                        seedHits.Add(new MemoryLib.Models.ScanMatch { Address = addr, Region = region, RegionOffset = offset + i });
+                        ulong addr = region.BaseAddress + offset + (ulong)i;
+                        seedHits.Add(new MemoryLib.Models.ScanMatch { Address = addr, Region = region, RegionOffset = offset + (ulong)i });
                     }
                 }
-                offset += toRead - 3;
+                offset += (ulong)(toRead - 3);
                 if (toRead < 8 * 1024 * 1024) break;
             }
             if (seedHits.Count > 0) break; // found at least one
@@ -851,9 +850,9 @@ ProcessMemory? EnsureGameConnection()
     if (gctx.LastBoardAddr == 0 || _gameMemory == null) return null;
     var mem = _gameMemory;
 
-    int ri32(ulong addr) => mem.ReadInt32(addr) ?? throw new Exception();
-    long ri64(ulong addr) => mem.ReadInt64(addr) ?? throw new Exception();
-    ulong rptr(ulong addr) => mem.ReadPointer(addr) ?? throw new Exception();
+    int ri32(ulong addr) => mem.ReadInt32(addr);
+    long ri64(ulong addr) => mem.ReadInt64(addr);
+    ulong rptr(ulong addr) => mem.ReadPointer(addr);
 
     try
     {

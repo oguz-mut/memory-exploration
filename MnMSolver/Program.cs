@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using MnMSolver;
 
 // ── Configuration ──
 string logDir = @"C:\Users\oguzb\AppData\LocalLow\Elder Game\Project Gorgon";
@@ -43,195 +44,269 @@ void AddEvent(string msg)
 
 // ── Log Processing ──
 
-// ProcessTalkScreen(entityId, "title", "bodyHTML", "notification", Int32[id1, id2, ...], String["choice1", "choice2", ...], curState, TypeName)
+// Real log format: ProcessTalkScreen(-36, "title", "bodyHTML", "", System.Int32[], System.String[], 0, Generic)
+// Note: entity IDs are negative, choices are NOT expanded (show as System.Int32[]/System.String[])
 var _talkScreenRx = new Regex(
-    @"ProcessTalkScreen\((\d+),\s*""((?:[^""\\]|\\.)*)"",\s*""((?:[^""\\]|\\.)*)"",\s*""(?:[^""\\]|\\.)*"",\s*Int32\[([^\]]*)\],\s*String\[([^\]]*)\],\s*\d+,\s*(\w+)\)",
+    @"ProcessTalkScreen\((-?\d+),\s*""((?:[^""\\]|\\.)*)"",\s*""((?:[^""\\]|\\.)*)"",",
     RegexOptions.Compiled);
 
-var _preTalkScreenRx = new Regex(
-    @"ProcessPreTalkScreen\((\d+),\s*""((?:[^""\\]|\\.)*)""\)",
+var _startInteractionRx = new Regex(
+    @"ProcessStartInteraction\((-?\d+),\s*\d+,.*?""(MonstersAndMantids[^""]*)",
     RegexOptions.Compiled);
 
 var _screenTextRx = new Regex(
-    @"ProcessScreenText\(""([^""]*)""\)",
+    @"ProcessScreenText\([^,]+,\s*""([^""]*)""\)",
     RegexOptions.Compiled);
 
 void ProcessLogLine(string line)
 {
+    // Detect M&M table interaction start
+    if (line.Contains("MonstersAndMantids"))
+    {
+        var sm = _startInteractionRx.Match(line);
+        if (sm.Success)
+        {
+            int entityId = int.Parse(sm.Groups[1].Value);
+            _mnmNpcId = entityId;
+            AddEvent($"[+] M&M table interaction started (entity {entityId})");
+        }
+    }
+
     // ProcessTalkScreen
+    if (!line.Contains("ProcessTalkScreen(")) return;
     var m = _talkScreenRx.Match(line);
-    if (m.Success)
+    if (!m.Success) return;
+
+    int npcId = int.Parse(m.Groups[1].Value);
+    string title = m.Groups[2].Value.Replace("\\\"", "\"");
+    string bodyHtml = m.Groups[3].Value.Replace("\\\"", "\"").Replace("\\n", "\n");
+
+    bool isMnM = title.Contains("Monsters", StringComparison.OrdinalIgnoreCase)
+              || title.Contains("Mantids", StringComparison.OrdinalIgnoreCase);
+    if (!isMnM) return;
+
+    // Skip empty bodies (loading screens)
+    if (string.IsNullOrWhiteSpace(bodyHtml)) return;
+
+    lock (_lock)
     {
-        int entityId = int.Parse(m.Groups[1].Value);
-        string title = m.Groups[2].Value.Replace("\\\"", "\"");
-        string bodyHtml = m.Groups[3].Value.Replace("\\\"", "\"").Replace("\\n", "\n");
-        string rawChoiceIds = m.Groups[4].Value;
-        string rawChoices = m.Groups[5].Value;
-        string talkType = m.Groups[6].Value;
-
-        bool isMnM = title.Contains("Monsters", StringComparison.OrdinalIgnoreCase)
-                  || title.Contains("Mantids", StringComparison.OrdinalIgnoreCase)
-                  || talkType == "DiceRoll";
-        if (!isMnM) return;
-
-        // Parse choice IDs: "1, 2, 3" -> [1, 2, 3]
-        var choiceIds = rawChoiceIds
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(s => int.TryParse(s, out var n) ? n : 0)
-            .ToList();
-
-        // Parse choice labels: "\"Cash Out\", \"Delve Deeper\"" -> ["Cash Out", "Delve Deeper"]
-        var choiceLabels = Regex.Matches(rawChoices, @"""((?:[^""\\]|\\.)*)""")
-            .Select(cm => cm.Groups[1].Value.Replace("\\\"", "\""))
-            .ToList();
-
-        lock (_lock)
+        // Don't start a new game if this is just the R.I.P. follow-up screen of a game that just ended
+        bool isDeathContinuation = _currentGame?.Status == "over"
+            && (bodyHtml.Contains("You have died") || bodyHtml.Contains("R.I.P."));
+        if (!isDeathContinuation && (_currentGame == null || _currentGame.Status != "playing"))
         {
-            if (_currentGame == null || _currentGame.Status != "playing")
-            {
-                _currentGame = new MnMGame();
-                _mnmNpcId = entityId;
-                AddEvent($"[+] New MnM game started (NPC {entityId}): {title}");
-            }
-
-            var game = _currentGame;
-            game.RawLastHtml = bodyHtml;
-
-            ParseGameState(bodyHtml, game);
-
-            game.Choices = choiceIds
-                .Zip(choiceLabels, (id, label) => (id, label))
-                .ToList();
-
-            game.Phase = DetectPhase(game);
+            _currentGame = new MnMGame();
+            _mnmNpcId = npcId;
+            AddEvent($"[+] New MnM game detected: {title}");
         }
 
-        // Dump raw HTML for learning
-        try
+        var game = _currentGame;
+        game.RawLastHtml = bodyHtml;
+
+        ParseGameState(bodyHtml, game);
+        game.Phase = DetectPhase(game);
+        if (game.Phase != GamePhase.GameOver && game.Phase != GamePhase.WaitingForGame && game.Phase != GamePhase.Unknown)
+            UpdateRecommendation(game, bodyHtml);
+
+        // Detect game end
+        if (game.Phase == GamePhase.GameOver && game.Status == "playing")
         {
-            var rawLogPath = Path.Combine(settingsDir, "mnm_raw_logs.txt");
-            File.AppendAllText(rawLogPath,
-                $"\n=== {DateTime.Now:yyyy-MM-dd HH:mm:ss} | {title} | Phase={_currentGame?.Phase} ===\n{bodyHtml}\n");
+            game.Status = "over";
+            game.FinalGold = game.Gold;
+            game.FinalTokens = game.CulturalArtifacts;
+            _gameHistory.Add(game);
+            AddEvent($"[!] Game ended: {(game.CashedOut ? "CASHED OUT" : "DIED")} | Gold={game.Gold} Artifacts={game.CulturalArtifacts} Encounters={game.EncounterNumber}");
         }
-        catch { }
-
-        AddEvent($"[*] TalkScreen: {title} | Phase={_currentGame?.Phase} | Choices={_currentGame?.Choices.Count}");
-        return;
     }
 
-    // ProcessPreTalkScreen
-    var pm = _preTalkScreenRx.Match(line);
-    if (pm.Success)
+    // Dump raw HTML for learning
+    try
     {
-        int entityId = int.Parse(pm.Groups[1].Value);
-        string info = pm.Groups[2].Value;
-        AddEvent($"[~] PreTalkScreen entity={entityId}: {info}");
-        return;
+        var rawLogPath = Path.Combine(settingsDir, "mnm_raw_logs.txt");
+        File.AppendAllText(rawLogPath,
+            $"\n=== {DateTime.Now:yyyy-MM-dd HH:mm:ss} | {title} | Phase={_currentGame?.Phase} ===\n{bodyHtml}\n");
     }
+    catch { }
 
-    // ProcessScreenText — watch for gold payouts
-    var sm = _screenTextRx.Match(line);
-    if (sm.Success)
-    {
-        string text = sm.Groups[1].Value;
-        if (text.Contains("Council", StringComparison.OrdinalIgnoreCase))
-            AddEvent($"[*] ScreenText (gold?): {text}");
-    }
+    AddEvent($"[*] {title} | Phase={_currentGame?.Phase} | HP={_currentGame?.CurrentHP}/{_currentGame?.MaxHP} Gold={_currentGame?.Gold} Enemy={_currentGame?.EnemyName}");
 }
 
 // ── State Parser ──
+// Real HTML uses TextMeshPro tags: <b>, <em>, <color=#hex>, <size=+N>, <voffset=Nem>, <pos=N>, <indent=N>, <sprite=...>
 void ParseGameState(string bodyHtml, MnMGame game)
 {
-    // Strip HTML tags for plain text parsing
-    string plain = Regex.Replace(bodyHtml, "<[^>]+>", " ");
-    plain = System.Net.WebUtility.HtmlDecode(plain);
+    // Strip all tags for plain text parsing
+    string plain = Regex.Replace(bodyHtml, @"<[^>]+>", " ");
+    plain = Regex.Replace(plain, @"\s+", " ").Trim();
 
-    // HP: "Health: N/M", "HP: N/M", "Hit Points: N/M"
-    var hpM = Regex.Match(plain, @"(?:Health|HP|Hit Points)\s*[:\-]\s*(\d+)\s*/\s*(\d+)", RegexOptions.IgnoreCase);
+    // Your Health: N / M (from status blocks and combat screens)
+    var hpM = Regex.Match(plain, @"Your Health:\s*(\d+)\s*/\s*(\d+)");
     if (hpM.Success)
     {
         game.CurrentHP = int.Parse(hpM.Groups[1].Value);
         game.MaxHP = int.Parse(hpM.Groups[2].Value);
     }
 
-    // Gold: "Gold: N", "found N gold", "gained N gold"
-    var goldM = Regex.Match(plain, @"(?:Gold\s*:\s*(\d+)|(?:found|gained)\s+(\d+)\s+gold)", RegexOptions.IgnoreCase);
+    // Gold: N (from status blocks)
+    var goldM = Regex.Match(plain, @"Gold:\s*(\d+)");
     if (goldM.Success)
-    {
-        var val = goldM.Groups[1].Success ? goldM.Groups[1].Value : goldM.Groups[2].Value;
-        if (int.TryParse(val, out int g)) game.Gold = g;
-    }
+        game.Gold = int.Parse(goldM.Groups[1].Value);
 
-    // Cultural Artifacts: "Cultural Artifacts: N"
-    var artM = Regex.Match(plain, @"Cultural Artifacts?\s*[:\-]\s*(\d+)", RegexOptions.IgnoreCase);
-    if (artM.Success && int.TryParse(artM.Groups[1].Value, out int art))
-        game.CulturalArtifacts = art;
+    // Cultural Artifacts: N
+    var artM = Regex.Match(plain, @"Cultural Artifacts?:\s*(\d+)");
+    if (artM.Success)
+        game.CulturalArtifacts = int.Parse(artM.Groups[1].Value);
 
-    // Level: "Level N"
-    var lvlM = Regex.Match(plain, @"\bLevel\s+(\d+)\b", RegexOptions.IgnoreCase);
-    if (lvlM.Success && int.TryParse(lvlM.Groups[1].Value, out int lvl))
-        game.Level = lvl;
+    // Health Potions: N
+    var potM = Regex.Match(plain, @"Health Potions?:\s*(\d+)");
+    if (potM.Success)
+        game.HealthPotions = int.Parse(potM.Groups[1].Value);
 
-    // Enemy + dice formula: word(s) followed by "(NdM+K)" or "(ND+K)" or "(ND6+K)"
-    var enemyM = Regex.Match(plain, @"([A-Z][a-zA-Z\s\-']+?)\s*\((\d+[Dd]\d*(?:[+\-]\d+)?)\)", RegexOptions.IgnoreCase);
-    if (enemyM.Success)
-    {
-        game.EnemyName = enemyM.Groups[1].Value.Trim();
-        game.EnemyDice = enemyM.Groups[2].Value.Trim();
-    }
+    // Makeshift Bombs: N
+    var bombM = Regex.Match(plain, @"Makeshift Bombs?:\s*(\d+)");
+    if (bombM.Success)
+        game.MakeshiftBombs = int.Parse(bombM.Groups[1].Value);
 
-    // Hat: "Hat: ..." or "wearing ..."
-    var hatM = Regex.Match(plain, @"(?:Hat\s*[:\-]\s*|wearing\s+)([A-Za-z][A-Za-z\s]+?)(?:\.|,|$)", RegexOptions.IgnoreCase);
+    // Your Hat: HatName (from status blocks: "Your Hat: Moist Towel")
+    var hatM = Regex.Match(plain, @"Your Hat:\s*(.+?)(?:\s+Boosts|\s*$)");
     if (hatM.Success)
         game.HatName = hatM.Groups[1].Value.Trim();
 
-    // Abilities: "AbilityName (NdM+K)"
-    var abilityMatches = Regex.Matches(plain, @"([A-Z][a-zA-Z\s]+?)\s+\((\d+[Dd]\d+(?:[+\-]\d+)?)\)");
-    foreach (Match am in abilityMatches)
+    // Hat description from <indent=20><i>...</i></indent> after hat name
+    var hatDescM = Regex.Match(bodyHtml, @"<indent=\d+><i>(.*?)</i></indent>");
+    if (hatDescM.Success)
+        game.HatDescription = Regex.Replace(hatDescM.Groups[1].Value, @"<[^>]+>", "").Trim();
+
+    // Enemy name from combat: "Borbo vs. EnemyName" pattern
+    var vsM = Regex.Match(plain, @"\w+ vs\.\s+(.+?)(?:\s+Health:|$)");
+    if (vsM.Success)
     {
-        var name = am.Groups[1].Value.Trim();
-        var dice = am.Groups[2].Value.Trim();
-        // Avoid duplicating enemy entry
-        if (name != game.EnemyName && !game.Abilities.Any(a => a.name == name))
-            game.Abilities.Add((name, dice));
+        string enemy = vsM.Groups[1].Value.Trim();
+        if (game.EnemyName != enemy)
+        {
+            game.EnemyName = enemy;
+            game.EnemyDice = null; // will be looked up from monster DB
+            // Count new encounters
+            if (!plain.Contains("Dead"))
+                game.EncounterNumber++;
+        }
     }
 
-    // Encounter number
-    var encM = Regex.Match(plain, @"(?:Encounter|Floor|Room)\s+#?\s*(\d+)", RegexOptions.IgnoreCase);
-    if (encM.Success && int.TryParse(encM.Groups[1].Value, out int enc))
-        game.EncounterNumber = enc;
-
-    // Detect death / game over
-    if (Regex.IsMatch(plain, @"\b(?:defeated|dead|died|game over)\b", RegexOptions.IgnoreCase))
+    // Enemy health from: "EnemyName Health: N / M" or "Dead"
+    var ehM = Regex.Match(plain, @"Health:\s*(\d+)\s*/\s*(\d+).*?Your Health:");
+    if (ehM.Success)
     {
-        game.Died = true;
-        game.Status = "over";
+        game.EnemyCurrentHP = int.Parse(ehM.Groups[1].Value);
+        game.EnemyMaxHP = int.Parse(ehM.Groups[2].Value);
+    }
+    if (plain.Contains("Dead") && plain.Contains("vs."))
+        game.EnemyCurrentHP = 0;
+
+    // Damage dealt: "You dealt N damage while Enemy dealt M damage."
+    var dmgM = Regex.Match(plain, @"You dealt\s+(\d+)\s+damage.*?dealt\s+(\d+)\s+damage");
+    if (dmgM.Success)
+    {
+        game.LastDamageDealt = int.Parse(dmgM.Groups[1].Value);
+        game.LastDamageTaken = int.Parse(dmgM.Groups[2].Value);
     }
 
-    // Detect cash-out
-    if (Regex.IsMatch(plain, @"\bcashed?\s*out\b", RegexOptions.IgnoreCase))
+    // Level up: "You leveled up!"
+    if (plain.Contains("leveled up"))
+        game.Level++;
+
+    // "You can now use AbilityName N" — ability upgrade
+    var abilUpM = Regex.Match(plain, @"You can now use (.+?)\s+\d+");
+    if (abilUpM.Success)
+    {
+        string upgraded = abilUpM.Groups[1].Value.Trim();
+        game.EventLog.Add($"Upgraded: {upgraded}");
+    }
+
+    // Rest/eat: "You eat EnemyName. Your Max Health is increased by N and you recover M health."
+    var eatM = Regex.Match(plain, @"You eat .+?\.\s*Your Max Health is increased by (\d+) and you recover (\d+) health");
+    if (eatM.Success)
+        game.EventLog.Add($"Ate corpse: +{eatM.Groups[1].Value} maxHP, healed {eatM.Groups[2].Value}");
+
+    // "found N gold coins" (from victory)
+    var lootGoldM = Regex.Match(plain, @"found (\d+) gold coins");
+    if (lootGoldM.Success)
+        game.EventLog.Add($"Loot: {lootGoldM.Groups[1].Value} gold");
+
+    // "found a new hat: HatName"
+    var lootHatM = Regex.Match(plain, @"found a new hat:\s*(.+?)!");
+    if (lootHatM.Success)
+        game.EventLog.Add($"Found hat: {lootHatM.Groups[1].Value}");
+
+    // "found a healing potion" / "found a cultural artifact"
+    if (plain.Contains("healing potion")) game.EventLog.Add("Found healing potion");
+    if (plain.Contains("cultural artifact")) game.EventLog.Add("Found cultural artifact");
+
+    // Detect game end: "Escaped the Caves" = successful cash out
+    if (plain.Contains("Escaped the") || plain.Contains("The End"))
     {
         game.CashedOut = true;
-        game.Status = "over";
+        // Parse leaderboard score
+        var scoreM = Regex.Match(plain, @"leaderboard score:\s*(\d+)");
+        if (scoreM.Success) game.LeaderboardScore = int.Parse(scoreM.Groups[1].Value);
     }
+
+    // Detect death: "You have died" appears in both the mutual-kill combat screen and the R.I.P. summary screen
+    if (plain.Contains("You have died") || plain.Contains("R.I.P."))
+    {
+        game.Died = true;
+        var scoreM2 = Regex.Match(plain, @"leaderboard score:\s*(\d+)");
+        if (scoreM2.Success) game.LeaderboardScore = int.Parse(scoreM2.Groups[1].Value);
+    }
+
+    // Perk gained: "You gained +N Max Health!" / "Your X ability became X+!"
+    var perkM = Regex.Match(plain, @"You gained \+(\d+ Max Health)");
+    if (perkM.Success) game.Perks.Add($"Tough (+{perkM.Groups[1].Value})");
+
+    var perkAbilM = Regex.Match(plain, @"Your (\w+) ability became (\w+\+?)!");
+    if (perkAbilM.Success) game.Perks.Add($"{perkAbilM.Groups[2].Value}");
 }
 
 // ── Phase Detection ──
+// Since choices are NOT in the log (System.Int32[]/System.String[]), detect phase from body text
 GamePhase DetectPhase(MnMGame game)
 {
-    var labels = game.Choices.Select(c => c.label).ToList();
-    var bodyText = game.RawLastHtml ?? "";
+    string body = game.RawLastHtml ?? "";
+    string plain = Regex.Replace(body, @"<[^>]+>", " ");
 
-    bool anyLabel(params string[] terms) =>
-        labels.Any(l => terms.Any(t => l.Contains(t, StringComparison.OrdinalIgnoreCase)));
+    // Game over states
+    if (game.CashedOut || plain.Contains("The End")) return GamePhase.GameOver;
+    if (game.Died) return GamePhase.GameOver;
 
-    if (anyLabel("Delve Deeper", "Cash Out")) return GamePhase.PostVictoryChoice;
-    if (anyLabel("Keep", "Wear")) return GamePhase.HatSelection;
-    if (anyLabel("Diplomacy", "Walk Away")) return GamePhase.DiplomacyCheck;
-    if (bodyText.Contains("perk", StringComparison.OrdinalIgnoreCase)) return GamePhase.PerkSelection;
-    if (bodyText.Contains("meditat", StringComparison.OrdinalIgnoreCase)) return GamePhase.MeditateChoice;
-    if (game.Died || bodyText.Contains("game over", StringComparison.OrdinalIgnoreCase)) return GamePhase.GameOver;
-    if (labels.Count > 0) return GamePhase.CombatAbilitySelect;
+    // Combat: "Use which attack?" or "vs." with health bars
+    if (plain.Contains("Use which attack")) return GamePhase.CombatAbilitySelect;
+
+    // Post-victory: "Do you want to go deeper" / "retreat and end your adventure"
+    if (plain.Contains("go deeper") || plain.Contains("retreat and end")) return GamePhase.PostVictoryChoice;
+
+    // Rest/Meditate choice: "you can meditate" and "eat the corpse"
+    if (plain.Contains("you can meditate") && plain.Contains("eat the corpse")) return GamePhase.MeditateChoice;
+
+    // Perk selection: "Pick a Perk"
+    if (plain.Contains("Pick a Perk", StringComparison.OrdinalIgnoreCase)) return GamePhase.PerkSelection;
+
+    // Hat selection: "choose which hat to wear"
+    if (plain.Contains("choose which hat")) return GamePhase.HatSelection;
+
+    // Shop encounter: "Buy hat" / "Buy bomb" from goblin
+    if (plain.Contains("Buy hat") || plain.Contains("Buy bomb")) return GamePhase.ShopEncounter;
+
+    // Diplomacy: "Diplomacy Check" / "trick" / "calm"
+    if (plain.Contains("Diplomacy", StringComparison.OrdinalIgnoreCase)) return GamePhase.DiplomacyCheck;
+
+    // Saving throw
+    if (plain.Contains("Saving Throw", StringComparison.OrdinalIgnoreCase)) return GamePhase.SavingThrow;
+
+    // Adventure intro
+    if (plain.Contains("Adventure M1") || plain.Contains("traveled to the")) return GamePhase.WaitingForGame;
+
+    // Leaderboard screen
+    if (plain.Contains("Skillcode") || plain.Contains("rolling high-score")) return GamePhase.WaitingForGame;
+
     return GamePhase.Unknown;
 }
 
@@ -289,6 +364,78 @@ async Task RunHttpServer(CancellationToken ct)
     listener.Stop();
 }
 
+// ── Recommendation Engine ──
+void UpdateRecommendation(MnMGame game, string bodyHtml)
+{
+    string plain = Regex.Replace(bodyHtml, @"<[^>]+>", " ");
+
+    string action = "", rationale = "";
+    double evCashOut = 0, evDelve = 0, evRest = 0, pSurvive = 0;
+
+    switch (game.Phase)
+    {
+        case GamePhase.PostVictoryChoice:
+        {
+            var r = DecisionEngine.DecidePostVictory(
+                game.CurrentHP, game.MaxHP, game.Gold, game.CulturalArtifacts,
+                game.EncounterNumber, null, null, canRest: false, estimatedHealDice: 0);
+            (action, rationale, evCashOut, evDelve, evRest, pSurvive) = r;
+            break;
+        }
+        case GamePhase.MeditateChoice:
+        {
+            var eatM = Regex.Match(plain, @"regain\s+(\d+D[+\-]?\d*)", RegexOptions.IgnoreCase);
+            double eatHeal = 0;
+            if (eatM.Success) { var (c, s, b) = DecisionEngine.ParseDice(eatM.Groups[1].Value); eatHeal = DecisionEngine.AverageRoll(c, s, b); }
+            double hpPct = game.MaxHP > 0 ? (double)game.CurrentHP / game.MaxHP : 1.0;
+            pSurvive = DecisionEngine.ProbSurvive(game.CurrentHP, game.EnemyName, null, game.EncounterNumber + 1);
+            double healedHP = Math.Min(game.MaxHP, game.CurrentHP + eatHeal);
+            double pSurviveHealed = DecisionEngine.ProbSurvive((int)healedHP, game.EnemyName, null, game.EncounterNumber + 1);
+            if (hpPct < 0.45 && pSurviveHealed - pSurvive > 0.08)
+            { action = "Rest"; rationale = $"HP low ({game.CurrentHP}/{game.MaxHP}). Eating heals ~{eatHeal:F0} HP, survival {pSurvive:P0} → {pSurviveHealed:P0}."; }
+            else
+            { action = "Meditate"; rationale = $"HP ok ({game.CurrentHP}/{game.MaxHP} = {hpPct:P0}). Meditate to upgrade ability — free power gain."; }
+            break;
+        }
+        case GamePhase.CombatAbilitySelect:
+        {
+            pSurvive = DecisionEngine.ProbSurvive(game.CurrentHP, game.EnemyName, null, game.EncounterNumber);
+            string danger = pSurvive < 0.5 ? " ⚠ DANGER" : "";
+            action = "?";
+            rationale = $"P(survive hit) = {pSurvive:P0} vs {game.EnemyName ?? "enemy"}.{danger} Ability names not visible in log.";
+            break;
+        }
+        case GamePhase.HatSelection:
+        {
+            var newHatM = Regex.Match(plain, @"found a new hat[:\s]+([^\n!.]+)", RegexOptions.IgnoreCase);
+            string newName = newHatM.Success ? newHatM.Groups[1].Value.Trim() : "new hat";
+            action = "?";
+            rationale = $"New: {newName}. Current: {game.HatName} — {game.HatDescription ?? "no desc"}. Compare effects manually.";
+            break;
+        }
+        case GamePhase.PerkSelection:
+            action = "?";
+            rationale = "Choices not in log. Priority: Lucky > Tough/Resilient > Diplomat > damage perks.";
+            break;
+        case GamePhase.DiplomacyCheck:
+            pSurvive = DecisionEngine.Prob3d6GeqTarget(10, game.CulturalArtifacts);
+            action = pSurvive > 0.5 && game.MaxHP > 0 && game.CurrentHP > 0.3 * game.MaxHP ? "Attempt" : "Skip";
+            rationale = $"P(success with {game.CulturalArtifacts} artifacts) ≈ {pSurvive:P0}. {(game.CurrentHP <= 0.3 * game.MaxHP ? "HP too low — crit fail is fatal." : "")}";
+            break;
+    }
+
+    if (action == "") return;
+    game.RecAction    = action;
+    game.RecRationale = rationale;
+    game.RecEvCashOut = evCashOut;
+    game.RecEvDelve   = evDelve;
+    game.RecEvRest    = evRest;
+    game.RecPSurvive  = pSurvive;
+    game.LastDecision = $"[{action}] {rationale}";
+    if (action != "?")
+        AddEvent($"[>] {game.Phase}: {action} — {rationale}");
+}
+
 // ── BuildApiState ──
 object BuildApiState(MnMGame? game, List<MnMGame> history, List<string> evLog)
 {
@@ -320,14 +467,32 @@ object BuildApiState(MnMGame? game, List<MnMGame> history, List<string> evLog)
             level = game.Level,
             gold = game.Gold,
             culturalArtifacts = game.CulturalArtifacts,
+            healthPotions = game.HealthPotions,
+            makeshiftBombs = game.MakeshiftBombs,
             hat = game.HatName,
+            hatDescription = game.HatDescription,
             abilities = game.Abilities.Select(a => new { a.name, a.dice }).ToArray(),
             perks = game.Perks.ToArray()
         },
-        enemy = game.EnemyName == null ? null : new { name = game.EnemyName, dice = game.EnemyDice },
-        choices = game.Choices.Select(c => new { c.id, c.label }).ToArray(),
+        enemy = game.EnemyName == null ? null : new
+        {
+            name = game.EnemyName,
+            dice = game.EnemyDice,
+            currentHP = game.EnemyCurrentHP,
+            maxHP = game.EnemyMaxHP
+        },
+        leaderboardScore = game.LeaderboardScore,
         encounterNumber = game.EncounterNumber,
         lastDecision = game.LastDecision,
+        recommendation = game.RecAction == null ? null : new
+        {
+            action    = game.RecAction,
+            rationale = game.RecRationale,
+            evCashOut = Math.Round(game.RecEvCashOut, 1),
+            evDelve   = Math.Round(game.RecEvDelve,   1),
+            evRest    = Math.Round(game.RecEvRest,    1),
+            pSurvive  = Math.Round(game.RecPSurvive * 100, 0)
+        },
         autoplay = _autoplay,
         autoloop = _autoloop,
         history = new { gamesPlayed = history.Count, wins, deaths, totalGold, totalTokens },
@@ -340,34 +505,32 @@ async Task TailLog(CancellationToken ct)
 {
     Console.WriteLine($"[*] Tailing {logPath}");
 
-    // Scan existing log for the last MnM TalkScreen
+    // Scan last portion of log for recent M&M TalkScreens
     {
-        string? lastMnMLine = null;
         using var scanFs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        long seekBack = scanFs.Length;
-        if (seekBack > 0)
+        // Only scan last 500KB to avoid processing entire log
+        long seekBack = Math.Min(scanFs.Length, 500_000);
+        scanFs.Seek(-seekBack, SeekOrigin.End);
+        using var scanReader = new StreamReader(scanFs);
+        scanReader.ReadLine(); // discard partial line
+
+        var mnmLines = new List<string>();
+        while (scanReader.ReadLine() is { } line)
         {
-            scanFs.Seek(-seekBack, SeekOrigin.End);
-            using var scanReader = new StreamReader(scanFs);
-            scanReader.ReadLine(); // discard partial line
-            while (scanReader.ReadLine() is { } line)
-            {
-                if (_talkScreenRx.IsMatch(line))
-                {
-                    var m2 = _talkScreenRx.Match(line);
-                    string t = m2.Groups[2].Value;
-                    string tp = m2.Groups[6].Value;
-                    if (t.Contains("Monsters", StringComparison.OrdinalIgnoreCase)
-                     || t.Contains("Mantids", StringComparison.OrdinalIgnoreCase)
-                     || tp == "DiceRoll")
-                        lastMnMLine = line;
-                }
-            }
+            if (line.Contains("Monsters") && line.Contains("ProcessTalkScreen"))
+                mnmLines.Add(line);
+            else if (line.Contains("MonstersAndMantids") && line.Contains("ProcessStartInteraction"))
+                mnmLines.Add(line);
         }
-        if (lastMnMLine != null)
+
+        if (mnmLines.Count > 0)
         {
-            Console.WriteLine("[*] Found existing MnM game in log, processing...");
-            ProcessLogLine(lastMnMLine);
+            Console.WriteLine($"[*] Found {mnmLines.Count} M&M events in log, replaying last game...");
+            // Find the last game start and replay from there
+            int lastStart = mnmLines.FindLastIndex(l => l.Contains("ProcessStartInteraction"));
+            int start = lastStart >= 0 ? lastStart : Math.Max(0, mnmLines.Count - 20);
+            for (int i = start; i < mnmLines.Count; i++)
+                ProcessLogLine(mnmLines[i]);
         }
     }
 
@@ -416,17 +579,26 @@ class MnMGame
     public int Level = 1;
     public int Gold;
     public int CulturalArtifacts;
+    public int HealthPotions;
+    public int MakeshiftBombs;
     public int EncounterNumber;
     public string? HatName = "Basic Hat";
+    public string? HatDescription;
     public List<(string name, string dice)> Abilities = new();
     public List<string> Perks = new();
     public string? EnemyName, EnemyDice;
+    public int EnemyCurrentHP, EnemyMaxHP;
+    public int LastDamageDealt, LastDamageTaken;
     public List<(int id, string label)> Choices = new();
     public GamePhase Phase = GamePhase.WaitingForGame;
     public string? LastDecision;
+    public string? RecAction;
+    public string? RecRationale;
+    public double RecEvCashOut, RecEvDelve, RecEvRest, RecPSurvive;
     public List<string> EventLog = new();
     public bool CashedOut, Died;
     public int FinalGold, FinalTokens;
+    public int LeaderboardScore;
     public string? RawLastHtml;
 }
 
@@ -467,6 +639,19 @@ static class DashboardHtml
   .choice { background: #0d1a2e; border: 1px solid #2a4a6e; border-radius: 4px; padding: 5px 8px; margin: 3px 0; cursor: default; }
   .choice:hover { border-color: #5a8abe; }
   .decision { background: #0d1a1a; border-left: 3px solid #2ea84b; padding: 6px 10px; border-radius: 0 4px 4px 0; font-style: italic; color: #a0e0a0; min-height: 30px; }
+  .rec-action { font-size: 20px; font-weight: bold; letter-spacing: 2px; margin-bottom: 6px; }
+  .rec-cashout { color: #e8c040; }
+  .rec-delve   { color: #40e880; }
+  .rec-rest    { color: #40b8e8; }
+  .rec-meditate { color: #a060e8; }
+  .rec-attempt  { color: #40e880; }
+  .rec-skip     { color: #e84040; }
+  .rec-unknown  { color: #888; }
+  .rec-rationale { color: #c0d0c0; font-size: 12px; margin-bottom: 8px; }
+  .ev-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+  .ev-cell { background: #0a1a2a; border: 1px solid #1a3a4a; border-radius: 4px; padding: 4px 8px; text-align: center; }
+  .ev-cell .ev-label { color: #6888a8; font-size: 10px; }
+  .ev-cell .ev-val { color: #c0e0ff; font-weight: bold; font-size: 13px; }
   .event-log { height: 180px; overflow-y: auto; background: #0d0d1a; border-radius: 4px; padding: 6px; }
   .event-entry { color: #9abaaa; margin: 1px 0; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
   .event-entry.new { color: #e0e0e0; }
@@ -575,8 +760,8 @@ function render(d) {
     ${choicesHtml}
   </div>
   <div class="panel">
-    <h2>Decision</h2>
-    <div class="decision">${d.lastDecision ? esc(d.lastDecision) : '<span style="color:#444">Awaiting decision engine...</span>'}</div>
+    <h2>Recommendation &mdash; <span class="phase-badge">${esc(d.phase)}</span></h2>
+    ${renderRecommendation(d.recommendation)}
     <div style="margin-top:8px;color:#6878a8;font-size:11px">Autoplay: ${d.autoplay ? '<span style="color:#2ea84b">ON</span>' : 'OFF'} | Autoloop: ${d.autoloop ? '<span style="color:#2ea84b">ON</span>' : 'OFF'}</div>
   </div>
 </div>
@@ -584,6 +769,33 @@ function render(d) {
 ${renderHistory(d.history)}
 ${renderEventLog(d.eventLog)}
 `;
+}
+
+function renderRecommendation(r) {
+  if (!r) return '<div style="color:#444;font-style:italic">Awaiting decision...</div>';
+  const actionLower = r.action.toLowerCase();
+  const cls = actionLower === 'cashout' ? 'rec-cashout'
+            : actionLower === 'delve'   ? 'rec-delve'
+            : actionLower === 'rest'    ? 'rec-rest'
+            : actionLower === 'meditate' ? 'rec-meditate'
+            : actionLower === 'attempt' ? 'rec-attempt'
+            : actionLower === 'skip'    ? 'rec-skip'
+            : 'rec-unknown';
+  const label = r.action === '?' ? '— see rationale —' : r.action.toUpperCase();
+  let evHtml = '';
+  if (r.evCashOut > 0 || r.evDelve > 0) {
+    evHtml = `<div class="ev-row">
+      <div class="ev-cell"><div class="ev-label">EV Cash Out</div><div class="ev-val">${r.evCashOut}</div></div>
+      <div class="ev-cell"><div class="ev-label">EV Delve</div><div class="ev-val">${r.evDelve}</div></div>
+      ${r.evRest > 0 ? `<div class="ev-cell"><div class="ev-label">EV Rest</div><div class="ev-val">${r.evRest}</div></div>` : ''}
+      ${r.pSurvive > 0 ? `<div class="ev-cell"><div class="ev-label">P(survive)</div><div class="ev-val">${r.pSurvive}%</div></div>` : ''}
+    </div>`;
+  } else if (r.pSurvive > 0) {
+    evHtml = `<div class="ev-row"><div class="ev-cell"><div class="ev-label">P(survive hit)</div><div class="ev-val">${r.pSurvive}%</div></div></div>`;
+  }
+  return `<div class="rec-action ${cls}">${esc(label)}</div>
+          <div class="rec-rationale">${esc(r.rationale)}</div>
+          ${evHtml}`;
 }
 
 function renderHistory(h) {

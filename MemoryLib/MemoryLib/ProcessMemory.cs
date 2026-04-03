@@ -60,10 +60,12 @@ public sealed class ProcessMemory : IDisposable
     }
 
     internal readonly IntPtr Handle;
+    public int ProcessId { get; }
 
-    private ProcessMemory(IntPtr handle)
+    private ProcessMemory(IntPtr handle, int pid)
     {
         Handle = handle;
+        ProcessId = pid;
     }
 
     public static int? FindGameProcess()
@@ -108,7 +110,7 @@ public sealed class ProcessMemory : IDisposable
         IntPtr handle = OpenProcess(0x0410, false, pid);
         if (handle == IntPtr.Zero)
             throw new InvalidOperationException($"Failed to open process {pid}. Error: {Marshal.GetLastWin32Error()}");
-        return new ProcessMemory(handle);
+        return new ProcessMemory(handle, pid);
     }
 
     public void Dispose()
@@ -139,6 +141,12 @@ public sealed class ProcessMemory : IDisposable
     {
         byte[]? buf = ReadBytes(addr, 4);
         return buf == null ? 0 : BitConverter.ToInt32(buf, 0);
+    }
+
+    public long ReadInt64(ulong addr)
+    {
+        byte[]? buf = ReadBytes(addr, 8);
+        return buf == null ? 0L : BitConverter.ToInt64(buf, 0);
     }
 
     public ushort ReadUInt16(ulong addr)

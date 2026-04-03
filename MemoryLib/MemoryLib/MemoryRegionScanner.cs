@@ -12,14 +12,18 @@ public sealed class MemoryRegionScanner
     private const uint PAGE_READABLE_MASK = 0x66u;
 
     private readonly ProcessMemory _memory;
+    private List<MemoryRegion>? _cachedRegions;
 
     public MemoryRegionScanner(ProcessMemory memory)
     {
         _memory = memory;
     }
 
+    public void InvalidateCache() => _cachedRegions = null;
+
     public List<MemoryRegion> GetGameRegions()
     {
+        if (_cachedRegions != null) return _cachedRegions;
         var regions = new List<MemoryRegion>();
         ulong addr = 0;
 
@@ -44,6 +48,7 @@ public sealed class MemoryRegionScanner
             addr = next;
         }
 
+        _cachedRegions = regions;
         return regions;
     }
 
