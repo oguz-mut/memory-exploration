@@ -18,6 +18,9 @@ class Match3Config
 
     /// <summary>Per-piece item values (from items.json). Index matches Pieces[]. 0 = unknown.</summary>
     [JsonIgnore] public int[] PieceValues { get; set; } = [];
+
+    /// Cashfall satisficing target — solver stops at first sequence reaching this score.
+    [JsonIgnore] public int TargetScore { get; set; } = 2500;
 }
 
 class PieceInfo

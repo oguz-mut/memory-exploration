@@ -272,10 +272,23 @@ void OnNewGame(int sessionId, Match3Config config)
                 string stratLabel;
                 if (gctx.Strategy == SolverStrategy.Auto)
                 {
-                    // Auto: use MCTS for low turns (≤4), Iterative for everything else.
+                    // Auto: Cashfall gets its own satisficing solver; otherwise MCTS for low turns (≤4), Iterative for everything else.
                     // Beam search plans 15 turns ahead assuming perfect PRNG — fiction in practice.
                     // Iterative with move ordering finds better first moves and respects PRNG reality.
-                    if (turnsLeft <= 4)
+                    if (string.Equals(solveConfig.Title, "Cashfall", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int budgetMs = 5000;
+                        Console.WriteLine($"[*] Auto-selected CashfallSolver (target={solveConfig.TargetScore})");
+                        ISolver solver = new CashfallSolver();
+                        var solveTask = Task.Run(() => solver.Solve(state, solveConfig, budgetMs));
+                        var completed = await Task.WhenAny(solveTask, Task.Delay(budgetMs + 2000));
+                        result = completed == solveTask
+                            ? await solveTask
+                            : new SolverResult { BestMoves = new List<SolverMove>(), PredictedScore = 0, StatesExplored = 0, Strategy = "timeout" };
+                        if (completed != solveTask) Console.WriteLine("[!] Solver hard timeout");
+                        stratLabel = "cashfall";
+                    }
+                    else if (turnsLeft <= 4)
                     {
                         int budgetMs = 5000; // more time for few turns
                         ISolver solver = new MCTSSolver();
