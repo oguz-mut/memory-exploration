@@ -19,6 +19,7 @@ class GameContext
 
     // ── Runtime settings (set from CLI args) ──
     public SolverStrategy Strategy = SolverStrategy.Auto;
+    public int ScoreCap = 1350;
     public bool Autoloop;
 
     // ── Grid calibration (pixels at 1920×1080 base resolution) ──

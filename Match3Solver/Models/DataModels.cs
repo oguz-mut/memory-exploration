@@ -18,6 +18,9 @@ class Match3Config
 
     /// <summary>Per-piece item values (from items.json). Index matches Pieces[]. 0 = unknown.</summary>
     [JsonIgnore] public int[] PieceValues { get; set; } = [];
+
+    /// Cashfall satisficing target — solver stops at first sequence reaching this score.
+    [JsonIgnore] public int TargetScore { get; set; } = 2500;
 }
 
 class PieceInfo
@@ -34,11 +37,16 @@ class StepResults
     public readonly Dictionary<int, int> Match5s = new();
     public readonly List<MatchLocation> Matches = new();
     public bool HadMatch4OrMore;
+    /// Unique pieces killed by type this step (indexed by piece type int).
+    /// Filled by SimBoard.Step() from the dead-cell array — correctly deduplicates
+    /// cross/plus shapes where a piece would otherwise be counted by two match runs.
+    public int[]? PiecesKilled;
 
     public void Clear()
     {
         Match3s.Clear(); Match4s.Clear(); Match5s.Clear();
         Matches.Clear(); HadMatch4OrMore = false;
+        PiecesKilled = null;
     }
 }
 

@@ -227,13 +227,13 @@ class SimGameState
         ScoreMatches(info.Match5s, _config.ScoreFor5s);
         if (info.HadMatch4OrMore) IsExtraTurnEarned = true;
 
-        foreach (var match in info.Matches)
+        // Use unique killed-piece counts (deduplicates cross-match shared pieces)
+        if (info.PiecesKilled != null)
         {
-            int type = match.Type;
-            if (type >= 0 && type < TotalPiecesMatched.Length)
+            for (int type = 0; type < info.PiecesKilled.Length && type < TotalPiecesMatched.Length; type++)
             {
-                TotalPiecesMatched[type] += match.Length;
-                TierPiecesMatched[type] += match.Length;
+                TotalPiecesMatched[type] += info.PiecesKilled[type];
+                TierPiecesMatched[type] += info.PiecesKilled[type];
             }
         }
     }
