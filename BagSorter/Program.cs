@@ -36,7 +36,7 @@ foreach (var prop in itemsDoc.RootElement.EnumerateObject())
         itemCodeToInternal[code] = iname;
         internalToItemCode[iname] = code;
     }
-    if (prop.Value.TryGetProperty("Value", out var val)) itemCodeToValue[code] = val.GetInt32();
+    if (prop.Value.TryGetProperty("Value", out var val) && val.TryGetInt32(out int valInt)) itemCodeToValue[code] = valInt;
     if (prop.Value.TryGetProperty("MaxStackSize", out var ms)) itemCodeToMaxStack[code] = ms.GetInt32();
     if (prop.Value.TryGetProperty("IconId", out var icon)) itemCodeToIconId[code] = icon.GetInt32();
     if (prop.Value.TryGetProperty("Description", out var desc)) itemCodeToDescription[code] = desc.GetString()!;
@@ -99,9 +99,12 @@ var inventory = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgno
 bool sorted = false;
 string sortMode = "category";
 string? memoryError = null;
+string scanStatus = "Initializing...";
 
 // --- MemoryLib setup ---
 InventoryReader? inventoryReader = null;
+List<InventoryItemSnapshot>? cachedItemInfos = null;
+bool fullScanDone = false;
 
 int? pid = ProcessMemory.FindGameProcess();
 if (pid == null)
@@ -127,6 +130,7 @@ else
         else
         {
             Console.WriteLine("AutoDiscover succeeded.");
+            scanStatus = "Running initial inventory scan (~15s)...";
         }
     }
     catch (Exception ex)
@@ -145,11 +149,40 @@ async Task MemoryPollLoop(CancellationToken ct)
         {
             try
             {
-                var items = inventoryReader.ReadAllItems();
-                if (items != null)
+                List<InventoryItemSnapshot>? bagItems = null;
+
+                if (fullScanDone)
+                {
+                    // Fast path: re-read the cached controller array directly
+                    bagItems = inventoryReader.ReadInventoryFast();
+                    if (bagItems == null)
+                    {
+                        Console.WriteLine("[BagSorter] Fast read failed — re-running full scan.");
+                        fullScanDone = false;
+                        scanStatus = "Re-scanning inventory...";
+                    }
+                }
+
+                if (!fullScanDone)
+                {
+                    // Full scan: Option A (structural) → Option B (controller list)
+                    cachedItemInfos ??= inventoryReader.ReadAllItems();
+                    if (cachedItemInfos != null)
+                    {
+                        var allItems = inventoryReader.ReadAllInventoryItems(cachedItemInfos);
+                        if (allItems != null)
+                        {
+                            bagItems = inventoryReader.ReadInventoryViaControllerList(allItems);
+                            fullScanDone = bagItems != null && bagItems != allItems;
+                            scanStatus = fullScanDone ? "Live" : "Scan complete (controller list not found)";
+                        }
+                    }
+                }
+
+                if (bagItems != null)
                 {
                     var newInv = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var item in items)
+                    foreach (var item in bagItems)
                         newInv.AddOrUpdate(item.InternalName, item.StackCount, (_, old) => old + item.StackCount);
                     inventory = newInv;
                     memoryError = null;
@@ -160,7 +193,7 @@ async Task MemoryPollLoop(CancellationToken ct)
                 memoryError = $"Memory read error: {ex.Message}";
             }
         }
-        await Task.Delay(2000, ct);
+        await Task.Delay(fullScanDone ? 5000 : 1000, ct);
     }
 }
 
@@ -230,6 +263,7 @@ object GetBagState()
         sorted,
         sortMode,
         categories = categoryCounts,
+        scanStatus,
         error = memoryError
     };
 }
@@ -380,6 +414,7 @@ body{font-family:'Segoe UI',sans-serif;background:#1a1a2e;color:#e0e0e0;font-siz
         <div class="stat"><span class="stat-label">Slots</span><br><span class="stat-value" id="totalSlots">0</span></div>
         <div class="stat"><span class="stat-label">Total Value</span><br><span class="stat-value gold" id="totalValue">0g</span></div>
         <div id="sortedStatus"></div>
+        <div class="stat" style="margin-left:auto"><span class="stat-label">Source</span><br><span class="stat-value" id="scanStatus" style="font-size:11px;color:#888">...</span></div>
     </div>
     <div class="toolbar">
         <span class="sort-label">Sort Bags:</span>
@@ -455,6 +490,7 @@ function render(){
     document.getElementById('totalItems').textContent=data.totalItems;
     document.getElementById('totalSlots').textContent=data.totalSlots;
     document.getElementById('totalValue').textContent=data.totalValue.toLocaleString()+'g';
+    document.getElementById('scanStatus').textContent=data.scanStatus||'';
     document.getElementById('sortedStatus').innerHTML=data.sorted
         ?'<span class="sorted-badge">Sorted: '+data.sortMode+'</span>'
         :'<span class="unsorted-badge">Unsorted</span>';

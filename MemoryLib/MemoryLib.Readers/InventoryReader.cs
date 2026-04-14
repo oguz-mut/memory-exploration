@@ -17,6 +17,11 @@ public class InventoryReader
     // tsysclientinfo.json data: powerIndex → (InternalName, tierIndex → EffectDescs)
     private readonly Dictionary<int, (string InternalName, Dictionary<int, string[]> Tiers)> _tsysPowers = new();
 
+    // Fast-path inventory cache (populated by ReadAllInventoryItems + ReadInventoryViaControllerList)
+    private ulong _cachedDataStart;    // start of UIInventoryController backing array data
+    private int   _cachedArrayLen;     // capacity of that array (in slots)
+    private Dictionary<ulong, InventoryItemSnapshot>? _itemInfoByAddr;  // infoPtr → ItemInfo snapshot
+
     // ItemInfo field offsets confirmed from live game memory dump ("Councils" item):
     //   +0x00  vtable (0x221D1E2B610)
     //   +0x08  sync   (0 for all observed objects)
@@ -1023,6 +1028,332 @@ public class InventoryReader
         if (!_tsysPowers.TryGetValue(powerIdx, out var power)) return ($"power_{powerIdx}[?]", Array.Empty<string>());
         power.Tiers.TryGetValue(tierIdx, out string[]? descs);
         return (power.InternalName, descs ?? Array.Empty<string>());
+    }
+
+    // Item wrapper field offsets used by inventory reads
+    private const int OffsetItemStackSize  = 0x1C;  // ushort
+    private const int OffsetItemFolderIdx  = 0x1F;  // byte
+
+    /// <summary>
+    /// Option A — Structural scan for ALL Item wrapper instances in memory.
+    ///
+    /// Same hot-path filter as ReadEquippedItemsStructural (check +0x10 against
+    /// ItemInfo address set) but returns both equipped and unequipped items.
+    /// ObjectAddress = Item wrapper address, IID populated, StackCount and FolderIdx
+    /// read from Item struct (+0x1C ushort, +0x1F byte).
+    ///
+    /// May include items from storage vaults if they were opened this session.
+    /// Use ReadInventoryViaControllerList for the exact player bag+equipped list.
+    /// </summary>
+    public List<InventoryItemSnapshot>? ReadAllInventoryItems(List<InventoryItemSnapshot> allItemInfos)
+    {
+        if (_itemInfoVtable == 0)
+        {
+            Console.Error.WriteLine("[InventoryReader] ReadAllInventoryItems: ItemInfo vtable not discovered.");
+            return null;
+        }
+
+        var itemInfoSet = new HashSet<ulong>(allItemInfos.Select(i => i.ObjectAddress));
+        Console.WriteLine($"[InventoryReader] Bag scan: {itemInfoSet.Count} ItemInfo addresses, scanning all memory...");
+
+        var results = new List<InventoryItemSnapshot>();
+        var seen = new HashSet<ulong>();
+        var seenIIDs = new HashSet<int>();
+        const int chunkSize = 8 * 1024 * 1024;
+
+        foreach (var region in _scanner.GetGameRegions())
+        {
+            ulong regionOffset = 0;
+            while (regionOffset < region.Size)
+            {
+                ulong remaining = region.Size - regionOffset;
+                int readSize = (int)Math.Min(remaining, (ulong)chunkSize);
+                ulong chunkBase = regionOffset;
+                byte[]? chunk = _memory.ReadBytes(region.BaseAddress + regionOffset, readSize);
+                regionOffset += (ulong)readSize;
+                if (chunk == null || chunk.Length < 0x40) continue;
+
+                int end = chunk.Length - 0x40;
+                for (int i = 0; i <= end; i += 8)
+                {
+                    ulong infoPtr = BitConverter.ToUInt64(chunk, i + 0x10);
+                    if (!itemInfoSet.Contains(infoPtr)) continue;
+
+                    ulong objBase = region.BaseAddress + chunkBase + (ulong)i;
+                    if (!seen.Add(objBase)) continue;
+
+                    if (BitConverter.ToUInt64(chunk, i + 0x08) != 0) continue;  // sync != 0
+                    if (!IsValidPointer(BitConverter.ToUInt64(chunk, i))) continue;  // bad vtable
+
+                    int iid = BitConverter.ToInt32(chunk, i + 0x18);
+                    if (iid <= 0 || iid > 1_000_000_000) continue;
+                    if (!seenIIDs.Add(iid)) continue;
+
+                    byte isEq  = chunk[i + 0x20];
+                    if (isEq > 1) continue;
+
+                    // Read StackSize (ushort +0x1C) and FolderIdx (byte +0x1F)
+                    ushort stackSize = BitConverter.ToUInt16(chunk, i + 0x1C);
+                    if (stackSize == 0) stackSize = 1;
+                    byte folderIdx = chunk[i + 0x1F];
+
+                    // Resolve name from ItemInfo
+                    string staticName = "?";
+                    ulong namePtr = _memory.ReadPointer(infoPtr + OffsetItemInfoStaticName);
+                    if (IsValidPointer(namePtr))
+                        staticName = _memory.ReadMonoString(namePtr, maxLength: 128) ?? "?";
+                    int typeId = _memory.ReadInt32(infoPtr + OffsetItemInfoTypeId);
+                    string internalName = _itemDataByTypeId.GetValueOrDefault(typeId, staticName);
+
+                    results.Add(new InventoryItemSnapshot
+                    {
+                        ObjectAddress = objBase,
+                        IID           = iid,
+                        ItemCode      = typeId,
+                        StackCount    = stackSize,
+                        InternalName  = internalName,
+                        IsEquipped    = isEq == 1,
+                        FolderIdx     = folderIdx,
+                    });
+                }
+            }
+        }
+
+        Console.WriteLine($"[InventoryReader] Bag scan: {results.Count} Item wrappers found.");
+
+        // Build infoPtr → snapshot map for fast-path re-reads
+        _itemInfoByAddr = allItemInfos.ToDictionary(i => i.ObjectAddress, i => i);
+
+        return results.OrderBy(x => x.FolderIdx).ThenBy(x => x.InternalName).ToList();
+    }
+
+    /// <summary>
+    /// Option B — Exact player inventory via UIInventoryController.items backing array.
+    ///
+    /// UIInventoryController has a static List&lt;Item&gt; at +0x10 of its static storage.
+    /// Rather than tracing the class object, we bootstrap from already-found Item wrapper
+    /// addresses: scan memory for a pointer array that contains ≥5 of them in a small window.
+    /// That dense cluster is the List&lt;Item&gt;._items backing array. Walking it gives exactly
+    /// the items in the player's UIInventoryController — no extras from storage vaults.
+    ///
+    /// Requires ReadAllInventoryItems to have been called first.
+    /// </summary>
+    public List<InventoryItemSnapshot>? ReadInventoryViaControllerList(List<InventoryItemSnapshot> allItems)
+    {
+        if (allItems.Count == 0) return null;
+
+        // Build lookup: wrapper address → snapshot
+        var addrToItem = new Dictionary<ulong, InventoryItemSnapshot>(allItems.Count);
+        foreach (var s in allItems)
+            addrToItem[s.ObjectAddress] = s;
+
+        // We need a fast set for the hot scan loop
+        var addrSet = new HashSet<ulong>(addrToItem.Keys);
+
+        // Scan all readable memory for a dense cluster of Item wrapper pointers.
+        // The UIInventoryController backing array stores pointers to Item objects
+        // (8 bytes each), so we look for windows of N consecutive 8-byte slots that
+        // contain ≥5 known Item addresses with no completely invalid entries (allowing
+        // zeros for ArrayList slack at the end).
+        //
+        // Window size: scan 256 slots (2KB) at a time with a sliding hit count.
+        const int WindowSlots  = 256;   // 2 KB window
+        const int HitThreshold = 5;     // need ≥5 known Item addresses in window
+
+        Console.WriteLine("[InventoryReader] Controller scan: looking for UIInventoryController.items array...");
+
+        ulong bestArrayStart = 0;
+        int   bestHits       = 0;
+        int   bestLen        = 0;
+
+        const int chunkSize = 8 * 1024 * 1024;
+        foreach (var region in _scanner.GetGameRegions())
+        {
+            ulong regionOffset = 0;
+            while (regionOffset < region.Size)
+            {
+                ulong remaining = region.Size - regionOffset;
+                int readSize = (int)Math.Min(remaining, (ulong)chunkSize);
+                ulong chunkBase = regionOffset;
+                byte[]? chunk = _memory.ReadBytes(region.BaseAddress + regionOffset, readSize);
+                regionOffset += (ulong)readSize;
+                if (chunk == null || chunk.Length < WindowSlots * 8) continue;
+
+                // Sliding window over 8-byte aligned positions
+                int slots = (chunk.Length - 8) / 8;
+
+                // Ring buffer of per-slot hit count
+                int[] hits = new int[slots];
+                for (int s = 0; s < slots; s++)
+                {
+                    ulong ptr = BitConverter.ToUInt64(chunk, s * 8);
+                    hits[s] = addrSet.Contains(ptr) ? 1 : 0;
+                }
+
+                // Sum hits in each window, find the best
+                int windowHits = 0;
+                for (int w = 0; w < Math.Min(WindowSlots, slots); w++)
+                    windowHits += hits[w];
+
+                for (int w = 0; w + WindowSlots <= slots; w++)
+                {
+                    if (windowHits > bestHits)
+                    {
+                        bestHits       = windowHits;
+                        bestArrayStart = region.BaseAddress + chunkBase + (ulong)(w * 8);
+                        bestLen        = WindowSlots;
+                    }
+                    if (w + WindowSlots < slots)
+                        windowHits += hits[w + WindowSlots] - hits[w];
+                }
+            }
+        }
+
+        if (bestHits < HitThreshold)
+        {
+            Console.WriteLine($"[InventoryReader] Controller scan: no dense cluster found (best={bestHits}/{HitThreshold} threshold). Falling back to full scan results.");
+            return allItems;
+        }
+
+        Console.WriteLine($"[InventoryReader] Controller scan: found array at 0x{bestArrayStart:X} ({bestHits} hits in {bestLen}-slot window)");
+
+        // Walk outward from bestArrayStart to find the full extent of the backing array.
+        // IL2CPP array header is 0x20 bytes before data; maxLen is at header+0x18.
+        // Try to read the array header: walk back 0x20 to find the maxLen.
+        ulong headerGuess = bestArrayStart;
+        // Heuristic: scan backward up to 128 bytes to find the array header
+        ulong dataStart = 0;
+        int   arrayLen  = 0;
+        for (int backOff = 0; backOff <= 128; backOff += 8)
+        {
+            if (bestArrayStart < (ulong)backOff) break;
+            ulong tryHeader = bestArrayStart - (ulong)backOff;
+            byte[]? hdr = _memory.ReadBytes(tryHeader, 0x28);
+            if (hdr == null) continue;
+            ulong trySync = BitConverter.ToUInt64(hdr, 8);
+            if (trySync != 0) continue;
+            int maxLen = (int)BitConverter.ToUInt32(hdr, 0x18);
+            if (maxLen < bestHits || maxLen > 100_000) continue;
+            // Looks plausible — data starts at tryHeader + 0x20
+            ulong tryDataStart = tryHeader + 0x20;
+            dataStart = tryDataStart;
+            arrayLen  = maxLen;
+            Console.WriteLine($"[InventoryReader] Array header at 0x{tryHeader:X}, maxLen={maxLen}");
+            break;
+        }
+
+        if (dataStart == 0)
+        {
+            // Fallback: just read the window we found
+            dataStart = bestArrayStart;
+            arrayLen  = bestLen;
+        }
+
+        // Cache for fast-path re-reads
+        _cachedDataStart = dataStart;
+        _cachedArrayLen  = arrayLen;
+
+        // Read the full array and collect items in slot order (= UIInventoryController order)
+        byte[]? arrBytes = _memory.ReadBytes(dataStart, arrayLen * 8);
+        if (arrBytes == null) return allItems;
+
+        var result = new List<InventoryItemSnapshot>(arrayLen);
+        var seenIIDs = new HashSet<int>();
+        for (int s = 0; s < arrayLen && s * 8 + 8 <= arrBytes.Length; s++)
+        {
+            ulong wrapperPtr = BitConverter.ToUInt64(arrBytes, s * 8);
+            if (wrapperPtr == 0) continue;
+
+            // Fast path: already parsed by Option A
+            if (addrToItem.TryGetValue(wrapperPtr, out var snap))
+            {
+                if (seenIIDs.Add(snap.IID))
+                    result.Add(snap);
+                continue;
+            }
+
+            // Fallback: read Item fields directly (covers items Option A missed due to sync filter etc.)
+            if (!IsValidPointer(wrapperPtr)) continue;
+            byte[]? itemBytes = _memory.ReadBytes(wrapperPtr, 0x28);
+            if (itemBytes == null || itemBytes.Length < 0x28) continue;
+
+            ulong infoPtr = BitConverter.ToUInt64(itemBytes, 0x10);
+            if (_itemInfoByAddr == null || !_itemInfoByAddr.TryGetValue(infoPtr, out var info)) continue;
+
+            int iid = BitConverter.ToInt32(itemBytes, 0x18);
+            if (iid <= 0 || !seenIIDs.Add(iid)) continue;
+
+            ushort stackSize = BitConverter.ToUInt16(itemBytes, 0x1C);
+            if (stackSize == 0) stackSize = 1;
+            byte folderIdx = itemBytes[0x1F];
+            byte isEq = itemBytes[0x20];
+
+            result.Add(new InventoryItemSnapshot
+            {
+                ObjectAddress = wrapperPtr,
+                IID           = iid,
+                ItemCode      = info.ItemCode,
+                StackCount    = stackSize,
+                InternalName  = info.InternalName,
+                IsEquipped    = isEq == 1,
+                FolderIdx     = folderIdx,
+            });
+        }
+
+        Console.WriteLine($"[InventoryReader] Controller scan: {result.Count} items from UIInventoryController.items.");
+        return result.Count >= HitThreshold ? result : allItems;
+    }
+
+    /// <summary>
+    /// Fast inventory refresh using cached UIInventoryController array address.
+    /// Call after a successful ReadAllInventoryItems + ReadInventoryViaControllerList pair.
+    /// Returns null if the cache is cold or the array has moved (caller should re-run full scan).
+    /// </summary>
+    public List<InventoryItemSnapshot>? ReadInventoryFast()
+    {
+        if (_cachedDataStart == 0 || _cachedArrayLen == 0 || _itemInfoByAddr == null)
+            return null;
+
+        byte[]? arrBytes = _memory.ReadBytes(_cachedDataStart, _cachedArrayLen * 8);
+        if (arrBytes == null) { _cachedDataStart = 0; return null; }
+
+        var results = new List<InventoryItemSnapshot>(_cachedArrayLen);
+        var seenIIDs = new HashSet<int>();
+
+        for (int s = 0; s < _cachedArrayLen && s * 8 + 8 <= arrBytes.Length; s++)
+        {
+            ulong wrapperPtr = BitConverter.ToUInt64(arrBytes, s * 8);
+            if (wrapperPtr == 0) continue;
+            if (!IsValidPointer(wrapperPtr)) continue;
+
+            byte[]? itemBytes = _memory.ReadBytes(wrapperPtr, 0x28);
+            if (itemBytes == null || itemBytes.Length < 0x28) continue;
+
+            ulong infoPtr = BitConverter.ToUInt64(itemBytes, 0x10);
+            if (!_itemInfoByAddr.TryGetValue(infoPtr, out var info)) continue;
+
+            int iid = BitConverter.ToInt32(itemBytes, 0x18);
+            if (iid <= 0 || !seenIIDs.Add(iid)) continue;
+
+            ushort stackSize = BitConverter.ToUInt16(itemBytes, 0x1C);
+            if (stackSize == 0) stackSize = 1;
+            byte folderIdx = itemBytes[0x1F];
+            byte isEq = itemBytes[0x20];
+
+            results.Add(new InventoryItemSnapshot
+            {
+                ObjectAddress = wrapperPtr,
+                IID           = iid,
+                ItemCode      = info.ItemCode,
+                StackCount    = stackSize,
+                InternalName  = info.InternalName,
+                IsEquipped    = isEq == 1,
+                FolderIdx     = folderIdx,
+            });
+        }
+
+        // Sanity: if we got dramatically fewer items than before, the array may have moved
+        return results.Count > 0 ? results : null;
     }
 
     public void DumpObjectLayout(ulong addr)
