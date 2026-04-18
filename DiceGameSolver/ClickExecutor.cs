@@ -441,7 +441,7 @@ public class ClickExecutor
         ClickAt(Calibration.Dismiss);
         await Task.Delay(300, ct);
         ClickAt(target.Value);
-        await Task.Delay(800, ct);
+        await Task.Delay(1000, ct);
         ExecutorStatus = "idle";
     }
 }
