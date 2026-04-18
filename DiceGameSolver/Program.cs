@@ -38,7 +38,9 @@ clicker.LatestStateProvider = () => lastState;
 await clicker.CalibrateAsync(cts.Token);
 
 var tailTask = Task.Run(() => watcher.RunAsync(cts.Token));
-var pipelineTask = Task.Run(async () =>
+
+// Parser task — fast, non-blocking. Updates lastState + stats as soon as lines arrive.
+var parserTask = Task.Run(async () =>
 {
     await foreach (var line in watcher.RawLineChannel.Reader.ReadAllAsync(cts.Token))
     {
@@ -46,19 +48,34 @@ var pipelineTask = Task.Run(async () =>
         while (recentLines.Count > 20) recentLines.TryDequeue(out _);
         var state = parser.Parse(line);
         if (state is null) continue;
-        lastState = state;
         if (state.Phase == GamePhase.Result) { gamesPlayed++; if (state.Won) gamesWon++; }
         if (state.Phase == GamePhase.CashOut)
         {
             var m = System.Text.RegularExpressions.Regex.Match(state.RawBody, @"receive (\d+) Councils");
             if (m.Success && int.TryParse(m.Groups[1].Value, out var paid)) sessionProfit += paid;
         }
-        var decision = solver.Decide(state);
+        lastState = state;
+    }
+});
+
+// Decision task — watches lastState.Signature; fires solver+clicker when it changes.
+var decisionTask = Task.Run(async () =>
+{
+    string lastSig = "";
+    while (!cts.Token.IsCancellationRequested)
+    {
+        await Task.Delay(80, cts.Token);
+        var s = lastState;
+        if (s is null) continue;
+        if (s.Signature == lastSig) continue;
+        lastSig = s.Signature;
+
+        var decision = solver.Decide(s);
         lastDecision = decision;
-        Console.WriteLine($"[main] {state.Phase} -> {decision.Action} (code {decision.ResponseCode}) EV={decision.EV:+#;-#;0} p={decision.WinProbability:P1} :: {decision.Rationale}");
+        Console.WriteLine($"[main] {s.Phase} -> {decision.Action} (code {decision.ResponseCode}) EV={decision.EV:+#;-#;0} p={decision.WinProbability:P1} :: {decision.Rationale}");
         if (autoPlay && decision.Action != DiceAction.NoOp && decision.ResponseCode != 0)
         {
-            try { await clicker.ClickResponseCodeAsync(decision.ResponseCode, state, cts.Token); }
+            try { await clicker.ClickResponseCodeAsync(decision.ResponseCode, s, cts.Token); }
             catch (Exception ex) { Console.WriteLine($"[main] click failed: {ex.Message}"); }
         }
     }
@@ -117,7 +134,7 @@ var httpTask = Task.Run(async () =>
     }
 });
 
-await Task.WhenAny(tailTask, pipelineTask, httpTask);
+await Task.WhenAny(tailTask, parserTask, decisionTask, httpTask);
 
 static string BuildDashboard(
     GameState? s, Decision? d, ClickExecutor clicker,

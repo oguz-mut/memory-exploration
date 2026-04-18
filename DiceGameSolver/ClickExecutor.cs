@@ -451,11 +451,19 @@ public class ClickExecutor
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
 
+        // Y-offset retry pattern: Result screens shift buttons by 0/1/2 dice-interaction lines.
+        // Pattern [0, -40, +40, -80, +80] explores rows around calibrated Y.
+        var yOffsets = currentState.Phase == GamePhase.Result
+            ? new[] { 0, -40, +40, -80, +80 }
+            : new[] { 0, 0, 0, 0, 0 };
+
         for (int attempt = 1; attempt <= MaxRetries; attempt++)
         {
-            ExecutorStatus = $"attempt {attempt}/{MaxRetries} phase={currentState.Phase} code={responseCode}";
-            Console.WriteLine($"[clicker] attempt {attempt}/{MaxRetries}: click target ({target.Value.X},{target.Value.Y})");
-            ClickAt(target.Value);
+            int dy = yOffsets[Math.Min(attempt - 1, yOffsets.Length - 1)];
+            var actual = new System.Drawing.Point(target.Value.X, target.Value.Y + dy);
+            ExecutorStatus = $"attempt {attempt}/{MaxRetries} phase={currentState.Phase} code={responseCode} dy={dy}";
+            Console.WriteLine($"[clicker] attempt {attempt}/{MaxRetries}: click target ({actual.X},{actual.Y}) dy={dy}");
+            ClickAt(actual);
 
             // Poll for state advance (signature change) up to PostClickDelayMs
             var deadline = DateTime.UtcNow.AddMilliseconds(PostClickDelayMs);
@@ -465,7 +473,7 @@ public class ClickExecutor
                 var latest = LatestStateProvider?.Invoke();
                 if (latest is not null && latest.Signature != preSig)
                 {
-                    Console.WriteLine($"[clicker] ADVANCED after {attempt} attempt(s) -> {latest.Signature}");
+                    Console.WriteLine($"[clicker] ADVANCED after {attempt} attempt(s) dy={dy} -> {latest.Signature}");
                     ExecutorStatus = "idle";
                     return;
                 }
