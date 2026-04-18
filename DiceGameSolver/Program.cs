@@ -82,6 +82,25 @@ var httpTask = Task.Run(async () =>
                 ctx.Response.Close();
                 continue;
             }
+            if (ctx.Request.HttpMethod == "POST" && ctx.Request.Url?.AbsolutePath == "/delay")
+            {
+                using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
+                var form = await reader.ReadToEndAsync();
+                // form body: "post=1200&dismiss=300"
+                var pairs = form.Split('&');
+                foreach (var p in pairs)
+                {
+                    var kv = p.Split('=');
+                    if (kv.Length != 2) continue;
+                    if (!int.TryParse(Uri.UnescapeDataString(kv[1]), out var val)) continue;
+                    val = Math.Clamp(val, 0, 10000);
+                    if (kv[0] == "post") clicker.PostClickDelayMs = val;
+                    else if (kv[0] == "dismiss") clicker.DismissDelayMs = val;
+                }
+                ctx.Response.Redirect("/");
+                ctx.Response.Close();
+                continue;
+            }
             var html  = BuildDashboard(lastState, lastDecision, clicker, gamesPlayed, gamesWon, sessionProfit, autoPlay, recentLines);
             var bytes = Encoding.UTF8.GetBytes(html);
             ctx.Response.ContentType = "text/html; charset=utf-8";
@@ -133,9 +152,14 @@ static string BuildDashboard(
         <h1>Dice Game Solver <span style='color:#666'>(:9883)</span></h1>
         """);
 
-    // Auto-play toggle
+    // Auto-play toggle + click-timing knobs
     sb.Append($"<div class='panel'><b>Auto-Play:</b> {autoLabel} &nbsp;");
-    sb.Append($"<form method='POST' action='/toggle'><button class='{autoCls}'>{autoBtn}</button></form></div>");
+    sb.Append($"<form method='POST' action='/toggle'><button class='{autoCls}'>{autoBtn}</button></form>");
+    sb.Append("<form method='POST' action='/delay' style='margin-top:10px'>");
+    sb.Append($"&nbsp;&nbsp;<label>post-click wait (ms): <input type='number' name='post' min='0' max='10000' step='50' value='{clicker.PostClickDelayMs}' style='width:80px'></label>");
+    sb.Append($"&nbsp;&nbsp;<label>dismiss wait (ms): <input type='number' name='dismiss' min='0' max='5000' step='50' value='{clicker.DismissDelayMs}' style='width:80px'></label>");
+    sb.Append("&nbsp;&nbsp;<button type='submit' style='background:#0f3460;color:#fff'>save</button>");
+    sb.Append("</form></div>");
 
     // Stats row
     string profitStr = sessionProfit == 0 ? "0" : $"{sessionProfit:+#;-#;0}";

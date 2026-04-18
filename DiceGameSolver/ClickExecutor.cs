@@ -43,6 +43,8 @@ public class ClickExecutor
 {
     public string ExecutorStatus { get; private set; } = "idle";
     public ClickCalibration? Calibration { get; private set; }
+    public int PostClickDelayMs { get; set; } = 1000;
+    public int DismissDelayMs { get; set; } = 300;
 
     // ── Win32 P/Invoke ───────────────────────────────────────────────────────
     [DllImport("user32.dll")] static extern bool SetCursorPos(int X, int Y);
@@ -439,9 +441,9 @@ public class ClickExecutor
         ExecutorStatus = $"clicking phase={currentState.Phase} code={responseCode}";
         FocusGameWindow();
         ClickAt(Calibration.Dismiss);
-        await Task.Delay(300, ct);
+        await Task.Delay(DismissDelayMs, ct);
         ClickAt(target.Value);
-        await Task.Delay(1000, ct);
+        await Task.Delay(PostClickDelayMs, ct);
         ExecutorStatus = "idle";
     }
 }
