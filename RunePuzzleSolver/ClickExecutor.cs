@@ -211,10 +211,20 @@ public class ClickExecutor
 
         await foreach (var action in input.Reader.ReadAllAsync(ct))
         {
-            ExecutorStatus = $"clicking: {string.Join("", action.SymbolIndices.Select(i => PuzzleStateReader.Symbols[i]))}";
+            // Safety clamp: the Minotaur Lock has exactly 4 slots. Truncate anything longer
+            // to prevent the UI from rejecting the click sequence if a stale/wrong-length
+            // guess slips through.
+            const int MAX_SYMBOLS = 4;
+            var symbols = action.SymbolIndices.Length > MAX_SYMBOLS
+                ? action.SymbolIndices.Take(MAX_SYMBOLS).ToArray()
+                : action.SymbolIndices;
+            if (action.SymbolIndices.Length != symbols.Length)
+                Console.WriteLine($"[clicker] WARNING: clamped guess from {action.SymbolIndices.Length} to {MAX_SYMBOLS} symbols");
+
+            ExecutorStatus = $"clicking: {string.Join("", symbols.Select(i => PuzzleStateReader.Symbols[i]))}";
             FocusGameWindow();
 
-            foreach (var symbolIndex in action.SymbolIndices)
+            foreach (var symbolIndex in symbols)
             {
                 var pos = calibration.RunePositions[symbolIndex];
                 ClickAt(pos.X, pos.Y);
@@ -222,7 +232,7 @@ public class ClickExecutor
             }
 
             ClickAt(calibration.SubmitPosition.X, calibration.SubmitPosition.Y);
-            Console.WriteLine($"[clicker] submitted: {string.Join("", action.SymbolIndices.Select(i => PuzzleStateReader.Symbols[i]))}");
+            Console.WriteLine($"[clicker] submitted: {string.Join("", symbols.Select(i => PuzzleStateReader.Symbols[i]))}");
 
             ExecutorStatus = "waiting for confirmation";
             int preCount = reader.GuessRowCount;

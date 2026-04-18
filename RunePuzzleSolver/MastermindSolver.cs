@@ -11,6 +11,11 @@ public class MastermindSolver
     public int CandidateCount { get; private set; }
     public string SolverStatus { get; private set; } = "idle";
 
+    // Minotaur Locks in War Caches are always 4 slots. Hardcoded because memory
+    // reader keeps latching onto pooled/leftover controllers with stale length
+    // values (6, 5, etc.) that produce wrong-length guesses like "77BBC".
+    private const int HARDCODED_CODE_LENGTH = 4;
+
     private static readonly string[] Symbols = ["7", "B", "C", "F", "K", "M", "P", "Q", "S", "T", "W", "X"];
 
     public async Task RunAsync(Channel<PuzzleState> input, CancellationToken ct)
@@ -32,21 +37,22 @@ public class MastermindSolver
                 continue;
             }
 
-            // Pin codeLength on first active state. Ignore later changes (reader may
-            // briefly latch onto a different object during a re-scan).
+            // Pin codeLength on first active state. HARDCODED to 4 regardless of what
+            // the memory reader reports — Minotaur Locks are always 4 slots and the
+            // reader has been unreliable.
             if (pinnedCodeLength == null)
             {
-                pinnedCodeLength = state.CodeLength;
-                candidates = GenerateAllCodes(12, state.CodeLength);
+                pinnedCodeLength = HARDCODED_CODE_LENGTH;
+                candidates = GenerateAllCodes(12, HARDCODED_CODE_LENGTH);
                 localHistory = [];
                 guessPending = false;
                 CandidateCount = candidates.Count;
-                SolverStatus = $"ready — {candidates.Count} candidates for length {state.CodeLength}";
-                Console.WriteLine($"[solver] New puzzle length={state.CodeLength}, {candidates.Count} candidates");
+                SolverStatus = $"ready — {candidates.Count} candidates for length {HARDCODED_CODE_LENGTH} (hardcoded)";
+                Console.WriteLine($"[solver] New puzzle length={HARDCODED_CODE_LENGTH} (hardcoded, reader reported {state.CodeLength}), {candidates.Count} candidates");
             }
             else if (state.CodeLength != pinnedCodeLength)
             {
-                Console.WriteLine($"[solver] WARNING: state.CodeLength={state.CodeLength} differs from pinned {pinnedCodeLength} — keeping pinned value (likely reader glitch)");
+                // Quietly ignore — reader disagreement is expected with hardcoded length
             }
 
             int len = pinnedCodeLength.Value;
