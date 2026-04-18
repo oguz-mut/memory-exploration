@@ -24,13 +24,6 @@ public class PuzzleStateReader
     // Need to read up to NumGuessesAllowed+4 bytes from object base: 0x68+4 = 0x6C
     private const int MinSpan = Offsets.RunePuzzleSubController.NumGuessesAllowed + 4;
 
-    // Minotaur Locks in War Caches: known-good field values. The scan uses these to
-    // reject the many pooled/prefab RunePuzzleSubController instances floating in
-    // memory and only lock onto the real active puzzle. Must match MastermindSolver
-    // HARDCODED_CODE_LENGTH and the observed numGuesses from the actual puzzle UI.
-    private const int ExpectedCodeLength = 4;
-    private const int ExpectedNumGuesses = 12;
-
     public async Task RunAsync(CancellationToken ct)
     {
         try
@@ -78,7 +71,7 @@ public class PuzzleStateReader
                             int codeLength = _memory.ReadInt32(_ctrlPtr + Offsets.RunePuzzleSubController.CodeLength);
                             int numGuesses = _memory.ReadInt32(_ctrlPtr + Offsets.RunePuzzleSubController.NumGuessesAllowed);
 
-                            if (codeLength == ExpectedCodeLength && numGuesses == ExpectedNumGuesses)
+                            if (codeLength >= 3 && codeLength <= 8 && numGuesses >= 5 && numGuesses <= 20)
                             {
                                 var history = ReadGuessHistory(_ctrlPtr);
                                 GuessRowCount = history.Count;
@@ -132,7 +125,7 @@ public class PuzzleStateReader
         {
             int codeLength = _memory.ReadInt32(_ctrlPtr + Offsets.RunePuzzleSubController.CodeLength);
             int numGuesses = _memory.ReadInt32(_ctrlPtr + Offsets.RunePuzzleSubController.NumGuessesAllowed);
-            if (codeLength == ExpectedCodeLength && numGuesses == ExpectedNumGuesses)
+            if (codeLength >= 3 && codeLength <= 8 && numGuesses >= 5 && numGuesses <= 20)
             {
                 ulong inputListPtr = _memory.ReadPointer(_ctrlPtr + Offsets.RunePuzzleSubController.InputDisplayButtons);
                 if (inputListPtr >= Offsets.MinValidPtr)
@@ -178,14 +171,13 @@ public class PuzzleStateReader
                         ulong vtable = BitConverter.ToUInt64(chunk, i);
                         if (vtable < Offsets.MinValidPtr) continue;
 
-                        // codeLength must match the known Minotaur Lock value exactly.
-                        // Broad range [3,8] matched multiple pooled objects.
+                        // codeLength at +0x64: must be in [3, 8]
                         int codeLength = BitConverter.ToInt32(chunk, i + Offsets.RunePuzzleSubController.CodeLength);
-                        if (codeLength != ExpectedCodeLength) continue;
+                        if (codeLength < 3 || codeLength > 8) continue;
 
-                        // numGuesses must match exactly too — the real puzzle has 12.
+                        // numGuesses at +0x68: must be in [5, 20]
                         int numGuesses = BitConverter.ToInt32(chunk, i + Offsets.RunePuzzleSubController.NumGuessesAllowed);
-                        if (numGuesses != ExpectedNumGuesses) continue;
+                        if (numGuesses < 5 || numGuesses > 20) continue;
 
                         // Validate vtable: first method pointer must be a valid code address
                         ulong method0 = _memory.ReadPointer(vtable);
