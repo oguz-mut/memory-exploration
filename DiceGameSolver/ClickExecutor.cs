@@ -439,11 +439,15 @@ public class ClickExecutor
             Console.WriteLine("[clicker] WARNING: Stand Pat not calibrated — using Roll1 position (reduced EV)");
 
         ExecutorStatus = $"clicking phase={currentState.Phase} code={responseCode}";
+        Console.WriteLine($"[clicker] START phase={currentState.Phase} code={responseCode} dismiss=({Calibration.Dismiss.X},{Calibration.Dismiss.Y}) target=({target.Value.X},{target.Value.Y})");
         FocusGameWindow();
+        Console.WriteLine($"[clicker] clicking dismiss ({Calibration.Dismiss.X},{Calibration.Dismiss.Y})");
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
+        Console.WriteLine($"[clicker] clicking target ({target.Value.X},{target.Value.Y}) after {DismissDelayMs}ms");
         ClickAt(target.Value);
         await Task.Delay(PostClickDelayMs, ct);
+        Console.WriteLine($"[clicker] DONE");
         ExecutorStatus = "idle";
     }
 }
