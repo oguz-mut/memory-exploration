@@ -24,8 +24,8 @@ public class ClickExecutor
 
     const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     const uint MOUSEEVENTF_LEFTUP   = 0x0004;
-    const int  VK_LBUTTON           = 0x01;
     const int  VK_ESCAPE            = 0x1B;
+    const int  VK_F8                = 0x77;  // calibration hotkey — no in-game action
 
     [StructLayout(LayoutKind.Sequential)] struct RECT  { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
@@ -95,7 +95,7 @@ public class ClickExecutor
 
             var instrLabel = new Label
             {
-                Text      = "Rune Puzzle Calibration\nClick each rune button in order:\n7  B  C  F  K  M  P  Q  S  T  W  X\nthen click Submit.\nESC to cancel.",
+                Text      = "Minotaur Lock Calibration\nHover over each rune and press F8 (do NOT click — it wastes a guess):\n7  B  C  F  K  M  P  Q  S  T  W  X\nthen hover the Open Vault button and press F8.\nESC to cancel.",
                 AutoSize  = false,
                 Dock      = DockStyle.Top,
                 Height    = 100,
@@ -105,7 +105,7 @@ public class ClickExecutor
 
             var statusLabel = new Label
             {
-                Text      = "Waiting for click 1/13: rune 7",
+                Text      = "Hover over rune 7 then press F8 (1/13)",
                 AutoSize  = false,
                 Dock      = DockStyle.Bottom,
                 Height    = 30,
@@ -118,7 +118,7 @@ public class ClickExecutor
 
             var calibration = new CalibrationData { RunePositions = new (int X, int Y)[12] };
             int clickIndex = 0;
-            string[] names = [.. PuzzleStateReader.Symbols, "Submit"]; // 13 entries
+            string[] names = [.. PuzzleStateReader.Symbols, "Open Vault"]; // 13 entries
 
             var bgThread = new Thread(() =>
             {
@@ -133,14 +133,14 @@ public class ClickExecutor
                     }
 
                     // Wait for any previous press to release
-                    while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 && !cancelled)
+                    while ((GetAsyncKeyState(VK_F8) & 0x8000) != 0 && !cancelled)
                     {
                         if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) { cancelled = true; TryInvoke(form, form.Close); return; }
                         Thread.Sleep(10);
                     }
 
                     // Wait for press
-                    while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0 && !cancelled)
+                    while ((GetAsyncKeyState(VK_F8) & 0x8000) == 0 && !cancelled)
                     {
                         if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) { cancelled = true; TryInvoke(form, form.Close); return; }
                         Thread.Sleep(10);
@@ -150,7 +150,7 @@ public class ClickExecutor
                     GetCursorPos(out var pt);
 
                     // Wait for release
-                    while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) Thread.Sleep(10);
+                    while ((GetAsyncKeyState(VK_F8) & 0x8000) != 0) Thread.Sleep(10);
 
                     if (clickIndex < 12)
                         calibration.RunePositions[clickIndex] = (pt.X, pt.Y);
@@ -163,8 +163,8 @@ public class ClickExecutor
                     {
                         int next = clickIndex;
                         string statusText = next < 12
-                            ? $"Waiting for click {next + 1}/13: rune {names[next]}"
-                            : "Waiting for click 13/13: Submit button";
+                            ? $"Hover over rune {names[next]} then press F8 ({next + 1}/13)"
+                            : "Hover over Open Vault then press F8 (13/13)";
                         TryInvoke(form, () => statusLabel.Text = statusText);
                     }
                     else
