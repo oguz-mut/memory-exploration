@@ -43,8 +43,12 @@ public class ClickExecutor
 {
     public string ExecutorStatus { get; private set; } = "idle";
     public ClickCalibration? Calibration { get; private set; }
-    public int PostClickDelayMs { get; set; } = 1000;
+    public int PostClickDelayMs { get; set; } = 2000;  // max wait for state advance per attempt
     public int DismissDelayMs { get; set; } = 300;
+    public int MaxRetries { get; set; } = 3;
+
+    /// <summary>Program.cs sets this to return the latest parsed state (for advance detection).</summary>
+    public Func<Models.GameState?>? LatestStateProvider { get; set; }
 
     // ── Win32 P/Invoke ───────────────────────────────────────────────────────
     [DllImport("user32.dll")] static extern bool SetCursorPos(int X, int Y);
@@ -438,16 +442,45 @@ public class ClickExecutor
         if (currentState.Phase == GamePhase.Playing && responseCode == GameState.CodeStandPat && Calibration.StandPatSkipped)
             Console.WriteLine("[clicker] WARNING: Stand Pat not calibrated — using Roll1 position (reduced EV)");
 
-        ExecutorStatus = $"clicking phase={currentState.Phase} code={responseCode}";
+        var preSig = currentState.Signature;
         Console.WriteLine($"[clicker] START phase={currentState.Phase} code={responseCode} dismiss=({Calibration.Dismiss.X},{Calibration.Dismiss.Y}) target=({target.Value.X},{target.Value.Y})");
+        Console.WriteLine($"[clicker] preSig: {preSig}");
+
         FocusGameWindow();
         Console.WriteLine($"[clicker] clicking dismiss ({Calibration.Dismiss.X},{Calibration.Dismiss.Y})");
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
-        Console.WriteLine($"[clicker] clicking target ({target.Value.X},{target.Value.Y}) after {DismissDelayMs}ms");
-        ClickAt(target.Value);
-        await Task.Delay(PostClickDelayMs, ct);
-        Console.WriteLine($"[clicker] DONE");
-        ExecutorStatus = "idle";
+
+        for (int attempt = 1; attempt <= MaxRetries; attempt++)
+        {
+            ExecutorStatus = $"attempt {attempt}/{MaxRetries} phase={currentState.Phase} code={responseCode}";
+            Console.WriteLine($"[clicker] attempt {attempt}/{MaxRetries}: click target ({target.Value.X},{target.Value.Y})");
+            ClickAt(target.Value);
+
+            // Poll for state advance (signature change) up to PostClickDelayMs
+            var deadline = DateTime.UtcNow.AddMilliseconds(PostClickDelayMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(100, ct);
+                var latest = LatestStateProvider?.Invoke();
+                if (latest is not null && latest.Signature != preSig)
+                {
+                    Console.WriteLine($"[clicker] ADVANCED after {attempt} attempt(s) -> {latest.Signature}");
+                    ExecutorStatus = "idle";
+                    return;
+                }
+            }
+
+            Console.WriteLine($"[clicker] attempt {attempt} no advance, state still {preSig}");
+            // On retry, also re-dismiss in case a dice overlay re-appeared
+            if (attempt < MaxRetries)
+            {
+                ClickAt(Calibration.Dismiss);
+                await Task.Delay(DismissDelayMs, ct);
+            }
+        }
+
+        Console.WriteLine($"[clicker] STUCK: {MaxRetries} attempts exhausted at {preSig}");
+        ExecutorStatus = $"STUCK at {preSig}";
     }
 }

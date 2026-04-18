@@ -34,6 +34,7 @@ int gamesPlayed = 0, gamesWon = 0, sessionProfit = 0;
 bool autoPlay   = false;
 var recentLines = new ConcurrentQueue<string>();
 
+clicker.LatestStateProvider = () => lastState;
 await clicker.CalibrateAsync(cts.Token);
 
 var tailTask = Task.Run(() => watcher.RunAsync(cts.Token));
@@ -96,6 +97,7 @@ var httpTask = Task.Run(async () =>
                     val = Math.Clamp(val, 0, 10000);
                     if (kv[0] == "post") clicker.PostClickDelayMs = val;
                     else if (kv[0] == "dismiss") clicker.DismissDelayMs = val;
+                    else if (kv[0] == "retries") clicker.MaxRetries = Math.Clamp(val, 1, 10);
                 }
                 ctx.Response.Redirect("/");
                 ctx.Response.Close();
@@ -164,6 +166,7 @@ static string BuildDashboard(
     sb.Append("<form method='POST' action='/delay' style='margin-top:10px'>");
     sb.Append($"&nbsp;&nbsp;<label>post-click wait (ms): <input type='number' name='post' min='0' max='10000' step='50' value='{clicker.PostClickDelayMs}' style='width:80px'></label>");
     sb.Append($"&nbsp;&nbsp;<label>dismiss wait (ms): <input type='number' name='dismiss' min='0' max='5000' step='50' value='{clicker.DismissDelayMs}' style='width:80px'></label>");
+    sb.Append($"&nbsp;&nbsp;<label>retries: <input type='number' name='retries' min='1' max='10' step='1' value='{clicker.MaxRetries}' style='width:50px'></label>");
     sb.Append("&nbsp;&nbsp;<button type='submit' style='background:#0f3460;color:#fff'>save</button>");
     sb.Append("</form></div>");
 
@@ -185,6 +188,7 @@ static string BuildDashboard(
     else
     {
         sb.Append($"Phase: <b>{s.Phase}</b><br>");
+        sb.Append($"<span style='font-size:11px;color:#888'>sig: {WebUtility.HtmlEncode(s.Signature)}</span><br>");
         if (s.Phase == GamePhase.Playing)
         {
             string redStr = s.RedDice.Length > 0

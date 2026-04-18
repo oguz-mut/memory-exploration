@@ -12,6 +12,10 @@ public sealed class GameState
     public int[] AvailableResponseCodes { get; set; } = System.Array.Empty<int>();
     public string RawBody { get; set; } = string.Empty;                  // retained for debugging
 
+    /// <summary>Stable identifier for the current screen — changes when the screen advances.</summary>
+    public string Signature =>
+        $"{Phase}|codes=[{string.Join(",", AvailableResponseCodes)}]|red=[{string.Join(",", RedDice)}]|dealer={DealerCurScore}|R={(Raised?1:0)}|W={(Won?1:0)}|B=[{string.Join(",", BluesRolled)}]";
+
     // Known response codes (see project_dice_game_protocol memory)
     public const int CodePlay = 1;          // Intro Play! / PlayAgain on loss
     public const int CodeRaise = 101;       // Raise Bet
