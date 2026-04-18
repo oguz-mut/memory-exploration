@@ -1,18 +1,21 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Windows.Forms;
 using DiceGameSolver.Models;
 
 namespace DiceGameSolver;
 
 public sealed class ClickCalibration
 {
-    public System.Drawing.Point Button1 { get; set; }
-    public System.Drawing.Point Button2 { get; set; }
-    public System.Drawing.Point Button3 { get; set; }
-    public System.Drawing.Point Button4 { get; set; }
-    public System.Drawing.Point Dismiss  { get; set; }
+    public System.Drawing.Point IntroPlay { get; set; }          // Intro screen: Play! Bet 1000
+    public System.Drawing.Point PlayingRaise { get; set; }       // Playing: Raise Bet (code 101)
+    public System.Drawing.Point PlayingStandPat { get; set; }    // Playing: Stand Pat (code 123) - optional
+    public System.Drawing.Point PlayingRoll1 { get; set; }       // Playing: Roll 1 die (code 121)
+    public System.Drawing.Point PlayingRoll2 { get; set; }       // Playing: Roll 2 dice (code 122)
+    public System.Drawing.Point ResultPlayAgainWin { get; set; } // Result Won: Play again (code 112)
+    public System.Drawing.Point ResultPlayAgainLose { get; set; }// Result Lost: Play Again (code 1)
+    public System.Drawing.Point Dismiss { get; set; }            // empty dialog area for dice-overlay dismiss
+    public bool StandPatSkipped { get; set; }
 
     private static string FilePath =>
         Path.Combine(
@@ -56,8 +59,9 @@ public class ClickExecutor
 
     const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     const uint MOUSEEVENTF_LEFTUP   = 0x0004;
-    const int  VK_LBUTTON           = 0x01;
     const int  VK_ESCAPE            = 0x1B;
+    const int  VK_SPACE             = 0x20;
+    const int  VK_S                 = 0x53;
 
     [StructLayout(LayoutKind.Sequential)] struct RECT       { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct POINT      { public int X, Y; }
@@ -106,184 +110,300 @@ public class ClickExecutor
 
     static void ClickAt(System.Drawing.Point pt) => ClickAt(pt.X, pt.Y);
 
-    static void TryInvoke(Form form, Action action)
+    // ── Key detection helpers ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Waits for SPACE key press and returns cursor position at the moment of press.
+    /// Pressing ESC throws OperationCanceledException.
+    /// Debounces: waits for key up + 200ms after capture.
+    /// </summary>
+    static async Task<System.Drawing.Point> WaitForSpaceAsync(CancellationToken ct)
     {
-        try { if (!form.IsDisposed) form.Invoke(action); }
-        catch (ObjectDisposedException) { }
+        // Wait for SPACE to be released if currently held
+        while ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(20, ct);
+        }
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+                throw new OperationCanceledException("Calibration cancelled by ESC");
+            if ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0)
+            {
+                GetCursorPos(out var pt);
+                while ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0)
+                    await Task.Delay(20, ct);
+                await Task.Delay(200, ct); // debounce
+                return new System.Drawing.Point(pt.X, pt.Y);
+            }
+            await Task.Delay(20, ct);
+        }
+    }
+
+    /// <summary>
+    /// Waits for SPACE (capture point), S (skip), or ESC (cancel).
+    /// Returns (point, skipped=false) on SPACE, (null, skipped=true) on S.
+    /// </summary>
+    static async Task<(System.Drawing.Point? point, bool skipped)> WaitForSpaceOrSkipAsync(CancellationToken ct)
+    {
+        // Wait for both SPACE and S to be released
+        while ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0 || (GetAsyncKeyState(VK_S) & 0x8000) != 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(20, ct);
+        }
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+                throw new OperationCanceledException("Calibration cancelled by ESC");
+            if ((GetAsyncKeyState(VK_S) & 0x8000) != 0)
+            {
+                while ((GetAsyncKeyState(VK_S) & 0x8000) != 0)
+                    await Task.Delay(20, ct);
+                await Task.Delay(200, ct);
+                return (null, true);
+            }
+            if ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0)
+            {
+                GetCursorPos(out var pt);
+                while ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0)
+                    await Task.Delay(20, ct);
+                await Task.Delay(200, ct);
+                return (new System.Drawing.Point(pt.X, pt.Y), false);
+            }
+            await Task.Delay(20, ct);
+        }
+    }
+
+    static char ReadYN()
+    {
+        while (true)
+        {
+            var k = Console.ReadKey(intercept: true);
+            if (k.Key == ConsoleKey.Y) return 'Y';
+            if (k.Key == ConsoleKey.N) return 'N';
+        }
     }
 
     // ── Calibration ──────────────────────────────────────────────────────────
-    public Task CalibrateAsync(CancellationToken ct)
+    public async Task CalibrateAsync(CancellationToken ct)
     {
         var saved = ClickCalibration.Load();
         if (saved != null)
         {
             Calibration = saved;
             Console.WriteLine("[clicker] Loaded saved calibration.");
-            return Task.CompletedTask;
+            return;
         }
 
-        Console.WriteLine("[clicker] Running calibration...");
-        Calibration = RunCalibration();
+        Console.WriteLine("[clicker] No saved calibration found. Starting console calibration...");
+        Calibration = await RunConsoleCalibrationAsync(ct);
         Console.WriteLine("[clicker] Calibration complete.");
-        return Task.CompletedTask;
     }
 
-    ClickCalibration RunCalibration()
+    static async Task<ClickCalibration> RunConsoleCalibrationAsync(CancellationToken ct)
     {
-        ClickCalibration? result = null;
-        bool cancelled = false;
+        var cal = new ClickCalibration();
 
-        var staThread = new Thread(() =>
+        // ── 1 of 8: Intro screen — Play button ────────────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine("=== Calibration 1 of 8: Intro screen — Play button ===");
+        Console.WriteLine("");
+        Console.WriteLine("  Open the dice mat dialog in-game and wait for the");
+        Console.WriteLine("  \"Play game?\" screen to appear (with Total Winnings /");
+        Console.WriteLine("  Total Games Played text).");
+        Console.WriteLine("");
+        Console.WriteLine("  Hover your mouse cursor over the [Play! Bet 1000 Councils]");
+        Console.WriteLine("  button. Then press SPACE.");
+        Console.WriteLine("");
+        Console.WriteLine("  (ESC cancels)");
         {
-            Application.EnableVisualStyles();
+            var p = await WaitForSpaceAsync(ct);
+            cal.IntroPlay = p;
+            Console.WriteLine($"  captured ({p.X}, {p.Y})");
+        }
 
-            var form = new Form
+        Console.WriteLine("");
+        Console.WriteLine("  >> Click [Play! Bet 1000 Councils] in-game now to start a round.");
+        Console.WriteLine("  >> Wait for the gameplay screen to appear");
+        Console.WriteLine("     (\"Your score from red dice is...\"), then continue.");
+
+        // ── 2 of 8: Gameplay — Raise Bet ──────────────────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine("=== Calibration 2 of 8: Gameplay screen — Raise Bet button ===");
+        Console.WriteLine("");
+        Console.WriteLine("  The gameplay screen should be visible.");
+        Console.WriteLine("");
+        Console.WriteLine("  Hover your mouse cursor over the [Raise Bet] button.");
+        Console.WriteLine("  Then press SPACE.");
+        Console.WriteLine("");
+        Console.WriteLine("  (ESC cancels)");
+        {
+            var p = await WaitForSpaceAsync(ct);
+            cal.PlayingRaise = p;
+            Console.WriteLine($"  captured ({p.X}, {p.Y})");
+        }
+
+        // ── 3 of 8: Gameplay — Stand Pat (skippable) ──────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine("=== Calibration 3 of 8: Gameplay screen — Stand Pat button ===");
+        Console.WriteLine("");
+        Console.WriteLine("  Stand Pat only appears when you are currently winning.");
+        Console.WriteLine("  If it is not visible right now, press S to skip.");
+        Console.WriteLine("");
+        Console.WriteLine("  Hover your mouse cursor over the [Stand Pat] button and press");
+        Console.WriteLine("  SPACE — or press S to skip this capture.");
+        Console.WriteLine("");
+        Console.WriteLine("  (S = skip, ESC = cancel)");
+        {
+            var (p, skipped) = await WaitForSpaceOrSkipAsync(ct);
+            if (skipped)
             {
-                Text            = "Dice Game Calibration",
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                TopMost         = true,
-                Width           = 480,
-                Height          = 220,
-                StartPosition   = FormStartPosition.Manual,
-                MaximizeBox     = false,
-                MinimizeBox     = false,
-            };
-            // position bottom-right so it doesn't cover the dice dialog
-            var area = Screen.PrimaryScreen?.WorkingArea ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
-            form.Location = new System.Drawing.Point(area.Right - form.Width - 20, area.Bottom - form.Height - 20);
-
-            var instrLabel = new Label
+                cal.StandPatSkipped = true;
+                Console.WriteLine("  skipped (Stand Pat will fall back to Roll 1 die at runtime)");
+            }
+            else
             {
-                Text =
-                    "Dice Game Button Calibration\n" +
-                    "Click each position in order:\n" +
-                    "  1. Top-most button slot\n" +
-                    "  2. Second button slot\n" +
-                    "  3. Third button slot\n" +
-                    "  4. Fourth button slot (click even if invisible)\n" +
-                    "  5. Dismiss area (empty dialog space to clear overlays)\n" +
-                    "ESC to cancel.",
-                AutoSize  = false,
-                Dock      = DockStyle.Top,
-                Height    = 130,
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Padding   = new Padding(8, 4, 8, 0),
-            };
+                cal.PlayingStandPat = p!.Value;
+                Console.WriteLine($"  captured ({p.Value.X}, {p.Value.Y})");
+            }
+        }
 
-            var statusLabel = new Label
+        // ── 4 of 8: Gameplay — Roll 1 die ─────────────────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine("=== Calibration 4 of 8: Gameplay screen — Roll 1 die button ===");
+        Console.WriteLine("");
+        Console.WriteLine("  Hover your mouse cursor over the [Roll 1 die] button.");
+        Console.WriteLine("  Then press SPACE.");
+        Console.WriteLine("");
+        Console.WriteLine("  (ESC cancels)");
+        {
+            var p = await WaitForSpaceAsync(ct);
+            cal.PlayingRoll1 = p;
+            Console.WriteLine($"  captured ({p.X}, {p.Y})");
+        }
+
+        // ── 5 of 8: Gameplay — Roll 2 dice ────────────────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine("=== Calibration 5 of 8: Gameplay screen — Roll 2 dice button ===");
+        Console.WriteLine("");
+        Console.WriteLine("  Hover your mouse cursor over the [Roll 2 dice] button.");
+        Console.WriteLine("  Then press SPACE.");
+        Console.WriteLine("");
+        Console.WriteLine("  (ESC cancels)");
+        {
+            var p = await WaitForSpaceAsync(ct);
+            cal.PlayingRoll2 = p;
+            Console.WriteLine($"  captured ({p.X}, {p.Y})");
+        }
+
+        // ── 6 of 8: Dismiss area ───────────────────────────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine("=== Calibration 6 of 8: Empty dialog area (dismiss point) ===");
+        Console.WriteLine("");
+        Console.WriteLine("  Hover your mouse cursor over an empty area of the dice dialog");
+        Console.WriteLine("  (not over any button). This position is used to dismiss the");
+        Console.WriteLine("  dice roll overlay before clicking a button.");
+        Console.WriteLine("  Then press SPACE.");
+        Console.WriteLine("");
+        Console.WriteLine("  (ESC cancels)");
+        {
+            var p = await WaitForSpaceAsync(ct);
+            cal.Dismiss = p;
+            Console.WriteLine($"  captured ({p.X}, {p.Y})");
+        }
+
+        // ── 7+8 of 8: Result screens — Win and Lose (loop until both captured) ─
+        Console.WriteLine("");
+        Console.WriteLine("  >> Play the round out in-game until the result screen appears.");
+        Console.WriteLine("  >> It will show either YOU WIN! or YOU LOSE.");
+        Console.WriteLine("  >> You must capture the [Play again] button from BOTH screens.");
+        Console.WriteLine("  >> Keep playing rounds until you have seen both outcomes.");
+
+        int resultStep = 7;
+        while (cal.ResultPlayAgainWin == default || cal.ResultPlayAgainLose == default)
+        {
+            string stillNeedBefore = (cal.ResultPlayAgainWin == default && cal.ResultPlayAgainLose == default)
+                ? "WIN and LOSE screens"
+                : cal.ResultPlayAgainWin == default ? "WIN screen" : "LOSE screen";
+
+            Console.WriteLine("");
+            Console.WriteLine($"=== Calibration {resultStep} of 8: Result screen — Play Again button ===");
+            Console.WriteLine($"    (Still need: {stillNeedBefore})");
+            Console.WriteLine("");
+            Console.WriteLine("  On the result screen (YOU WIN! or YOU LOSE), hover your");
+            Console.WriteLine("  mouse cursor over the [Play again] button. Then press SPACE.");
+            Console.WriteLine("");
+            Console.WriteLine("  (ESC cancels)");
+
+            var p = await WaitForSpaceAsync(ct);
+            Console.WriteLine($"  captured ({p.X}, {p.Y})");
+
+            Console.WriteLine("");
+            Console.WriteLine("  Was that the WIN screen (YOU WIN!)? Press Y for Yes, N for No (Lose screen).");
+            char answer = ReadYN();
+
+            if (answer == 'Y')
             {
-                Text      = "Click position 1: top-most button slot (1/5)",
-                AutoSize  = false,
-                Dock      = DockStyle.Bottom,
-                Height    = 30,
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Padding   = new Padding(8, 0, 8, 0),
-            };
-
-            form.Controls.Add(statusLabel);
-            form.Controls.Add(instrLabel);
-
-            var cal = new ClickCalibration();
-            int clickIndex = 0;
-            string[] prompts =
-            [
-                "Click position 1: top-most button slot (1/5)",
-                "Click position 2: second button slot (2/5)",
-                "Click position 3: third button slot (3/5)",
-                "Click position 4: fourth button slot (4/5)",
-                "Click position 5: dismiss area (5/5)",
-            ];
-
-            var bgThread = new Thread(() =>
-            {
-                while (clickIndex < 5 && !cancelled)
+                Console.WriteLine("  Y — saving as ResultPlayAgainWin.");
+                if (cal.ResultPlayAgainWin != default)
+                    Console.WriteLine("  (WIN already captured — discarding duplicate, please capture the other screen)");
+                else
                 {
-                    if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
-                    {
-                        cancelled = true;
-                        TryInvoke(form, form.Close);
-                        return;
-                    }
-
-                    // wait for any previous press to release
-                    while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 && !cancelled)
-                    {
-                        if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) { cancelled = true; TryInvoke(form, form.Close); return; }
-                        Thread.Sleep(10);
-                    }
-
-                    // wait for press
-                    while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0 && !cancelled)
-                    {
-                        if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) { cancelled = true; TryInvoke(form, form.Close); return; }
-                        Thread.Sleep(10);
-                    }
-                    if (cancelled) return;
-
-                    GetCursorPos(out var pt);
-
-                    // wait for release
-                    while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) Thread.Sleep(10);
-
-                    var point = new System.Drawing.Point(pt.X, pt.Y);
-                    switch (clickIndex)
-                    {
-                        case 0: cal.Button1 = point; break;
-                        case 1: cal.Button2 = point; break;
-                        case 2: cal.Button3 = point; break;
-                        case 3: cal.Button4 = point; break;
-                        case 4: cal.Dismiss  = point; break;
-                    }
-
-                    clickIndex++;
-
-                    if (clickIndex < 5)
-                    {
-                        string statusText = prompts[clickIndex];
-                        TryInvoke(form, () => statusLabel.Text = statusText);
-                    }
-                    else
-                    {
-                        cal.Save();
-                        result = cal;
-                        TryInvoke(form, form.Close);
-                    }
+                    cal.ResultPlayAgainWin = p;
+                    resultStep++;
                 }
-            }) { IsBackground = true };
+            }
+            else
+            {
+                Console.WriteLine("  N — saving as ResultPlayAgainLose.");
+                if (cal.ResultPlayAgainLose != default)
+                    Console.WriteLine("  (LOSE already captured — discarding duplicate, please capture the other screen)");
+                else
+                {
+                    cal.ResultPlayAgainLose = p;
+                    resultStep++;
+                }
+            }
 
-            form.Shown += (_, _) => bgThread.Start();
-            Application.Run(form);
+            if (cal.ResultPlayAgainWin == default || cal.ResultPlayAgainLose == default)
+            {
+                string stillNeedAfter = (cal.ResultPlayAgainWin == default && cal.ResultPlayAgainLose == default)
+                    ? "both screens"
+                    : cal.ResultPlayAgainWin == default ? "the WIN screen" : "the LOSE screen";
+                Console.WriteLine($"  >> Still need {stillNeedAfter}. Play another round and press SPACE on the next result screen.");
+            }
+        }
 
-            cancelled = true; // stop bgThread if form closed externally
-            bgThread.Join(2000);
-        });
+        cal.Save();
 
-        staThread.SetApartmentState(ApartmentState.STA);
-        staThread.Start();
-        staThread.Join();
+        Console.WriteLine("");
+        Console.WriteLine("=== Calibration Complete — Saved ===");
+        Console.WriteLine("");
+        Console.WriteLine($"  IntroPlay           ({cal.IntroPlay.X}, {cal.IntroPlay.Y})");
+        Console.WriteLine($"  PlayingRaise        ({cal.PlayingRaise.X}, {cal.PlayingRaise.Y})");
+        if (cal.StandPatSkipped)
+            Console.WriteLine($"  PlayingStandPat     (skipped — will use Roll1 at runtime)");
+        else
+            Console.WriteLine($"  PlayingStandPat     ({cal.PlayingStandPat.X}, {cal.PlayingStandPat.Y})");
+        Console.WriteLine($"  PlayingRoll1        ({cal.PlayingRoll1.X}, {cal.PlayingRoll1.Y})");
+        Console.WriteLine($"  PlayingRoll2        ({cal.PlayingRoll2.X}, {cal.PlayingRoll2.Y})");
+        Console.WriteLine($"  ResultPlayAgainWin  ({cal.ResultPlayAgainWin.X}, {cal.ResultPlayAgainWin.Y})");
+        Console.WriteLine($"  ResultPlayAgainLose ({cal.ResultPlayAgainLose.X}, {cal.ResultPlayAgainLose.Y})");
+        Console.WriteLine($"  Dismiss             ({cal.Dismiss.X}, {cal.Dismiss.Y})");
+        Console.WriteLine("");
 
-        if (result == null)
-            throw new OperationCanceledException("Calibration cancelled");
-        return result;
+        return cal;
     }
 
     // ── Click execution ──────────────────────────────────────────────────────
     public async Task ClickResponseCodeAsync(int responseCode, GameState currentState, CancellationToken ct)
     {
-        int index = Array.IndexOf(currentState.AvailableResponseCodes, responseCode);
-        if (index < 0)
-        {
-            ExecutorStatus = $"WARNING: code {responseCode} not in AvailableResponseCodes";
-            Console.WriteLine($"[clicker] {ExecutorStatus}");
-            return;
-        }
-        if (index > 3)
-        {
-            ExecutorStatus = $"WARNING: slot index {index} > 3, no button configured";
-            Console.WriteLine($"[clicker] {ExecutorStatus}");
-            return;
-        }
         if (Calibration is null)
         {
             ExecutorStatus = "WARNING: not calibrated";
@@ -291,19 +411,36 @@ public class ClickExecutor
             return;
         }
 
-        ExecutorStatus = $"clicking slot {index + 1} for code {responseCode}";
+        System.Drawing.Point? target = (currentState.Phase, responseCode) switch
+        {
+            (GamePhase.Intro,   GameState.CodePlay)         => Calibration.IntroPlay,
+            (GamePhase.Playing, GameState.CodeRaise)        => Calibration.PlayingRaise,
+            (GamePhase.Playing, GameState.CodeStandPat)     => Calibration.StandPatSkipped
+                                                                ? Calibration.PlayingRoll1
+                                                                : Calibration.PlayingStandPat,
+            (GamePhase.Playing, GameState.CodeRollOne)      => Calibration.PlayingRoll1,
+            (GamePhase.Playing, GameState.CodeRollTwo)      => Calibration.PlayingRoll2,
+            (GamePhase.Result,  GameState.CodePlayAgainWin) => Calibration.ResultPlayAgainWin,
+            (GamePhase.Result,  GameState.CodePlay)         => Calibration.ResultPlayAgainLose,
+            (GamePhase.CashOut, GameState.CodePlay)         => Calibration.ResultPlayAgainLose,
+            _ => (System.Drawing.Point?)null
+        };
+
+        if (target is null)
+        {
+            ExecutorStatus = $"WARNING: no mapping for phase={currentState.Phase} code={responseCode}";
+            Console.WriteLine($"[clicker] {ExecutorStatus}");
+            return;
+        }
+
+        if (currentState.Phase == GamePhase.Playing && responseCode == GameState.CodeStandPat && Calibration.StandPatSkipped)
+            Console.WriteLine("[clicker] WARNING: Stand Pat not calibrated — using Roll1 position (reduced EV)");
+
+        ExecutorStatus = $"clicking phase={currentState.Phase} code={responseCode}";
         FocusGameWindow();
         ClickAt(Calibration.Dismiss);
         await Task.Delay(300, ct);
-
-        var btn = index switch
-        {
-            0 => Calibration.Button1,
-            1 => Calibration.Button2,
-            2 => Calibration.Button3,
-            _ => Calibration.Button4,
-        };
-        ClickAt(btn);
+        ClickAt(target.Value);
         await Task.Delay(800, ct);
         ExecutorStatus = "idle";
     }
