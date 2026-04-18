@@ -32,6 +32,7 @@ GameState? lastState    = null;
 Decision?  lastDecision = null;
 int gamesPlayed = 0, gamesWon = 0, sessionProfit = 0;
 bool autoPlay   = false;
+bool forceRedecide = false;  // set when autoPlay flips ON so the current state gets re-evaluated
 var recentLines = new ConcurrentQueue<string>();
 
 clicker.LatestStateProvider = () => lastState;
@@ -67,7 +68,8 @@ var decisionTask = Task.Run(async () =>
         await Task.Delay(80, cts.Token);
         var s = lastState;
         if (s is null) continue;
-        if (s.Signature == lastSig) continue;
+        if (s.Signature == lastSig && !forceRedecide) continue;
+        forceRedecide = false;
         lastSig = s.Signature;
 
         var decision = solver.Decide(s);
@@ -96,6 +98,7 @@ var httpTask = Task.Run(async () =>
             if (ctx.Request.HttpMethod == "POST" && ctx.Request.Url?.AbsolutePath == "/toggle")
             {
                 autoPlay = !autoPlay;
+                if (autoPlay) forceRedecide = true;
                 ctx.Response.Redirect("/");
                 ctx.Response.Close();
                 continue;
