@@ -15,40 +15,58 @@ public class MastermindSolver
 
     public async Task RunAsync(Channel<PuzzleState> input, CancellationToken ct)
     {
-        int? currentCodeLength = null;
+        int? pinnedCodeLength = null;
         List<int[]> candidates = [];
         List<(int[] guess, int wrongPos, int rightPos)> localHistory = [];
-        bool firstGuessSent = false;
+        int guessesSent = 0;
 
         await foreach (PuzzleState state in input.Reader.ReadAllAsync(ct))
         {
             if (!state.IsActive)
             {
                 SolverStatus = "idle — puzzle not active";
-                currentCodeLength = null;
+                pinnedCodeLength = null;
                 candidates = [];
                 localHistory = [];
-                firstGuessSent = false;
+                guessesSent = 0;
                 continue;
             }
 
-            if (state.CodeLength != currentCodeLength)
+            // Pin codeLength on first active state. Ignore later changes (reader may
+            // briefly latch onto a different object during a re-scan).
+            if (pinnedCodeLength == null)
             {
-                currentCodeLength = state.CodeLength;
+                pinnedCodeLength = state.CodeLength;
                 candidates = GenerateAllCodes(12, state.CodeLength);
                 localHistory = [];
-                firstGuessSent = false;
+                guessesSent = 0;
                 CandidateCount = candidates.Count;
                 SolverStatus = $"ready — {candidates.Count} candidates for length {state.CodeLength}";
                 Console.WriteLine($"[solver] New puzzle length={state.CodeLength}, {candidates.Count} candidates");
             }
+            else if (state.CodeLength != pinnedCodeLength)
+            {
+                Console.WriteLine($"[solver] WARNING: state.CodeLength={state.CodeLength} differs from pinned {pinnedCodeLength} — keeping pinned value (likely reader glitch)");
+            }
 
-            // Prune from state history (ground truth)
+            int len = pinnedCodeLength.Value;
+
+            // Prune from state history (ground truth). Skip malformed entries.
             if (state.History.Count > localHistory.Count)
             {
                 foreach (var entry in state.History.Skip(localHistory.Count))
                 {
+                    if (entry.Guess.Length != len)
+                    {
+                        Console.WriteLine($"[solver] WARNING: history entry '{entry.Guess}' length {entry.Guess.Length} != {len}, skipping");
+                        continue;
+                    }
                     var guessArr = entry.Guess.Select(c => Array.IndexOf(Symbols, c.ToString())).ToArray();
+                    if (guessArr.Any(x => x < 0))
+                    {
+                        Console.WriteLine($"[solver] WARNING: history entry '{entry.Guess}' has unknown symbol, skipping");
+                        continue;
+                    }
                     localHistory.Add((guessArr, entry.WrongPos, entry.RightPos));
                     candidates = candidates.Where(c => Score(guessArr, c) == (entry.WrongPos, entry.RightPos)).ToList();
                 }
@@ -58,21 +76,23 @@ public class MastermindSolver
             }
 
             // Check if solved
-            if (localHistory.Count > 0 && localHistory[^1].rightPos == state.CodeLength)
+            if (localHistory.Count > 0 && localHistory[^1].rightPos == len)
             {
                 SolverStatus = $"SOLVED in {localHistory.Count} guesses!";
                 Console.WriteLine($"[solver] {SolverStatus}");
                 continue;
             }
 
-            // Send next guess if needed
-            bool needGuess = !firstGuessSent || state.History.Count >= localHistory.Count;
-            if (needGuess && candidates.Count > 0)
+            // Send next guess ONLY when the game has caught up with what we sent.
+            // guessesSent==localHistory.Count means every guess we sent is reflected
+            // in the game's history. If they differ, the game has not processed our
+            // last click-submit yet — wait instead of spamming duplicates.
+            if (guessesSent == localHistory.Count && candidates.Count > 0)
             {
-                var next = ComputeNextGuess(candidates, state.CodeLength);
+                var next = ComputeNextGuess(candidates, len);
                 Console.WriteLine($"[solver] candidates={CandidateCount} next=[{string.Join(",", next)}]");
                 await ActionChannel.Writer.WriteAsync(new GuessAction(next), ct);
-                firstGuessSent = true;
+                guessesSent++;
             }
         }
     }
