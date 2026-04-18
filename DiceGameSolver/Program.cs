@@ -130,8 +130,14 @@ static string BuildDashboard(
 
     sb.Append("""
         <!DOCTYPE html><html><head><meta charset="utf-8">
-        <meta http-equiv="refresh" content="1">
         <title>Dice Game Solver (:9883)</title>
+        <script>
+          setInterval(function(){
+            var a = document.activeElement;
+            if (a && (a.tagName === 'INPUT' || a.tagName === 'BUTTON' || a.tagName === 'SELECT' || a.tagName === 'TEXTAREA')) return;
+            location.reload();
+          }, 1000);
+        </script>
         <style>
         body  { background:#1a1a2e; color:#e0e0e0; font-family:monospace; padding:20px; }
         h1    { color:#a0c4ff; margin-bottom:10px; }
