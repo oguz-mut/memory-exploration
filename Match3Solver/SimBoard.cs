@@ -146,25 +146,56 @@ class SimBoard
 
         results.Clear();
         var dead = new bool[Width * Height];
+        // usedSpots tracks which cells have already been claimed by a prior match in this step.
+        // Mirrors the game's tempMatchedSpots / FillStepResults dedup logic:
+        // horizontal matches are enumerated first (GetPendingMatches scan order), so a vertical
+        // run that intersects a horizontal one has its effective length reduced by the shared cell.
+        // If the effective length drops below 3 the run doesn't score — preventing cross/plus
+        // shapes from being counted twice.
+        var usedSpots = new bool[Width * Height];
         foreach (var match in matches)
         {
             results.Matches.Add(match);
-            int len = match.Length;
-            var dict = len >= 5 ? results.Match5s : len >= 4 ? results.Match4s : results.Match3s;
-            dict.TryGetValue(match.Type, out int prev);
-            dict[match.Type] = prev + 1;
-            if (len >= 4) results.HadMatch4OrMore = true;
 
-            for (int i = 0; i < len; i++)
+            // Compute effective (non-overlapping) length for this match location
+            int effectiveLen = 0;
+            for (int i = 0; i < match.Length; i++)
             {
                 int mx = match.Pos.X + (match.Dir == MatchDirection.Horizontal ? i : 0);
                 int my = match.Pos.Y + (match.Dir == MatchDirection.Vertical ? i : 0);
-                dead[GetIdx(mx, my)] = true;
+                if (!usedSpots[GetIdx(mx, my)]) effectiveLen++;
+            }
+
+            // Score only if the effective run is still a match (≥3 new cells)
+            if (effectiveLen >= 3)
+            {
+                var dict = effectiveLen >= 5 ? results.Match5s : effectiveLen >= 4 ? results.Match4s : results.Match3s;
+                dict.TryGetValue(match.Type, out int prev);
+                dict[match.Type] = prev + 1;
+                if (effectiveLen >= 4) results.HadMatch4OrMore = true;
+            }
+
+            // Mark all cells in this run as used and dead (regardless of effective length,
+            // since the pieces are removed whether scored or not)
+            for (int i = 0; i < match.Length; i++)
+            {
+                int mx = match.Pos.X + (match.Dir == MatchDirection.Horizontal ? i : 0);
+                int my = match.Pos.Y + (match.Dir == MatchDirection.Vertical ? i : 0);
+                int idx = GetIdx(mx, my);
+                usedSpots[idx] = true;
+                dead[idx] = true;
             }
         }
 
+        // Count unique killed pieces per type for TotalPiecesMatched tracking
+        var killed = new int[NumPieceTypes];
         for (int i = 0; i < _pieces.Length; i++)
+        {
+            if (dead[i] && _pieces[i] >= 0 && _pieces[i] < NumPieceTypes)
+                killed[_pieces[i]]++;
             if (dead[i]) _pieces[i] = -1;
+        }
+        results.PiecesKilled = killed;
 
         for (int x = 0; x < Width; x++)
         {

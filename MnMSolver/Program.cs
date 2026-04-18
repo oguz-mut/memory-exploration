@@ -31,6 +31,9 @@ int _mnmNpcId = 0;
 bool _autoplay = false;
 bool _autoloop = false;
 var _eventLog = new List<string>();
+var _autoplayRng = new Random();
+var _autoplaySemaphore = new SemaphoreSlim(1, 1);
+bool _liveTailing = false;
 
 void AddEvent(string msg)
 {
@@ -88,6 +91,12 @@ void ProcessLogLine(string line)
     // Skip empty bodies (loading screens)
     if (string.IsNullOrWhiteSpace(bodyHtml)) return;
 
+    // Capture state for autoplay trigger (set inside lock, used after)
+    GamePhase capturedPhase = GamePhase.WaitingForGame;
+    string? capturedAction = null;
+    bool isGameJustEnded = false;
+    MnMGame? capturedGame = null;
+
     lock (_lock)
     {
         // Don't start a new game if this is just the R.I.P. follow-up screen of a game that just ended
@@ -100,7 +109,7 @@ void ProcessLogLine(string line)
             AddEvent($"[+] New MnM game detected: {title}");
         }
 
-        var game = _currentGame;
+        var game = _currentGame!;
         game.RawLastHtml = bodyHtml;
 
         ParseGameState(bodyHtml, game);
@@ -115,8 +124,13 @@ void ProcessLogLine(string line)
             game.FinalGold = game.Gold;
             game.FinalTokens = game.CulturalArtifacts;
             _gameHistory.Add(game);
+            isGameJustEnded = true;
             AddEvent($"[!] Game ended: {(game.CashedOut ? "CASHED OUT" : "DIED")} | Gold={game.Gold} Artifacts={game.CulturalArtifacts} Encounters={game.EncounterNumber}");
         }
+
+        capturedPhase = game.Phase;
+        capturedAction = game.RecAction;
+        capturedGame = game;
     }
 
     // Dump raw HTML for learning
@@ -129,6 +143,21 @@ void ProcessLogLine(string line)
     catch { }
 
     AddEvent($"[*] {title} | Phase={_currentGame?.Phase} | HP={_currentGame?.CurrentHP}/{_currentGame?.MaxHP} Gold={_currentGame?.Gold} Enemy={_currentGame?.EnemyName}");
+
+    // Autoplay: click the recommended button (only on live log events, not replays)
+    if (_autoplay && _liveTailing && capturedGame != null)
+    {
+        if (isGameJustEnded)
+        {
+            if (_autoloop)
+                _ = Task.Run(AutoloopNewGame);
+        }
+        else if (capturedPhase != GamePhase.WaitingForGame)
+        {
+            int btn = ResolveButtonIndex(capturedPhase, capturedAction, capturedGame);
+            _ = Task.Run(() => ExecuteAutoplayClick(capturedPhase, capturedAction, btn));
+        }
+    }
 }
 
 // ── State Parser ──
@@ -436,6 +465,99 @@ void UpdateRecommendation(MnMGame game, string bodyHtml)
         AddEvent($"[>] {game.Phase}: {action} — {rationale}");
 }
 
+// ── Autoplay ──
+
+int ResolveButtonIndex(GamePhase phase, string? action, MnMGame game)
+{
+    return phase switch
+    {
+        // Combat: always pick first ability (can't distinguish from log)
+        GamePhase.CombatAbilitySelect => 0,
+        // Delve=0, CashOut=last button (1)
+        GamePhase.PostVictoryChoice => action == "CashOut" ? 1 : 0,
+        // Meditate=0, Rest/Eat=1
+        GamePhase.MeditateChoice => action == "Rest" ? 1 : 0,
+        // Can't see perk names — pick first
+        GamePhase.PerkSelection => 0,
+        // Keep old=0, Take new=1; default to taking new hat (usually better)
+        GamePhase.HatSelection => DecisionEngine.ShouldTakeHat(game.HatDescription, null) ? 0 : 1,
+        // Attempt=0, Skip/Decline=1
+        GamePhase.DiplomacyCheck => action == "Skip" ? 1 : 0,
+        // Saving throw: just proceed (button 0)
+        GamePhase.SavingThrow => 0,
+        // Shop: skip by default (save gold)
+        GamePhase.ShopEncounter => 1,
+        // Unknown/narration: click Continue/OK (button 0)
+        GamePhase.Unknown => 0,
+        _ => 0,
+    };
+}
+
+async Task ExecuteAutoplayClick(GamePhase phase, string? action, int buttonIndex)
+{
+    if (!await _autoplaySemaphore.WaitAsync(0)) return; // skip if already clicking
+    try
+    {
+        if (!MnMAutoPlayer.IsCalibrated)
+        {
+            if (!MnMAutoPlayer.LoadCalibration())
+            {
+                AddEvent("[!] Autoplay: dialog not calibrated. Run with game visible to calibrate.");
+                MnMAutoPlayer.CalibrateDialog();
+            }
+        }
+
+        // Human-like delay before clicking (wait for dialog to render + "reading" time)
+        int delay = phase switch
+        {
+            GamePhase.CombatAbilitySelect => _autoplayRng.Next(300, 800),
+            GamePhase.Unknown => _autoplayRng.Next(800, 1500),   // narration screens — pause longer
+            _ => _autoplayRng.Next(500, 1200),
+        };
+        await Task.Delay(delay);
+
+        AddEvent($"[autoplay] {phase}: clicking button {buttonIndex} (action={action ?? "auto"})");
+        await MnMAutoPlayer.ClickDialogButton(buttonIndex, _autoplayRng);
+    }
+    catch (Exception ex)
+    {
+        AddEvent($"[!] Autoplay click failed: {ex.Message}");
+    }
+    finally
+    {
+        _autoplaySemaphore.Release();
+    }
+}
+
+async Task AutoloopNewGame()
+{
+    if (!await _autoplaySemaphore.WaitAsync(0)) return;
+    try
+    {
+        if (!MnMAutoPlayer.IsAutoloopCalibrated)
+        {
+            if (!MnMAutoPlayer.LoadAutoloopCalibration())
+            {
+                AddEvent("[!] Autoloop: not calibrated. Run with game visible to calibrate.");
+                MnMAutoPlayer.CalibrateAutoloop();
+            }
+        }
+
+        AddEvent("[autoloop] Starting new M&M game...");
+        await Task.Delay(_autoplayRng.Next(1500, 3000)); // wait for game-over screen to settle
+        await MnMAutoPlayer.StartNewGame(_autoplayRng);
+        AddEvent("[autoloop] New game sequence sent (dismiss → use → play)");
+    }
+    catch (Exception ex)
+    {
+        AddEvent($"[!] Autoloop failed: {ex.Message}");
+    }
+    finally
+    {
+        _autoplaySemaphore.Release();
+    }
+}
+
 // ── BuildApiState ──
 object BuildApiState(MnMGame? game, List<MnMGame> history, List<string> evLog)
 {
@@ -534,6 +656,8 @@ async Task TailLog(CancellationToken ct)
         }
     }
 
+    _liveTailing = true; // from here on, autoplay clicks are allowed
+
     using var fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
     fs.Seek(0, SeekOrigin.End);
     using var reader = new StreamReader(fs);
@@ -562,8 +686,19 @@ foreach (var arg in args)
     if (arg == "--autoloop") _autoloop = true;
 }
 
-if (_autoplay) Console.WriteLine("[*] Autoplay enabled");
-if (_autoloop) Console.WriteLine("[*] Autoloop enabled");
+if (_autoplay)
+{
+    Console.WriteLine("[*] Autoplay enabled");
+    // Pre-load calibrations so we don't block during gameplay
+    if (!MnMAutoPlayer.LoadCalibration())
+        Console.WriteLine("[!] Dialog not calibrated — will prompt on first game action");
+    if (_autoloop)
+    {
+        Console.WriteLine("[*] Autoloop enabled");
+        if (!MnMAutoPlayer.LoadAutoloopCalibration())
+            Console.WriteLine("[!] Autoloop not calibrated — will prompt after first game over");
+    }
+}
 
 var logTask = Task.Run(() => TailLog(cts.Token));
 var httpTask = Task.Run(() => RunHttpServer(cts.Token));

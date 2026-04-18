@@ -270,12 +270,35 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 SolverResult result;
                 string stratLabel;
-                if (gctx.Strategy == SolverStrategy.Auto)
+                if (gctx.Strategy == SolverStrategy.Human)
                 {
-                    // Auto: use MCTS for low turns (≤4), Iterative for everything else.
+                    // Human-like play: depth-1 with randomness, simulated think time
+                    var humanRng = new Random();
+                    int thinkMs = humanRng.Next(800, 2500); // humans take 1-2.5s to decide
+                    await Task.Delay(thinkMs);
+                    ISolver solver = new HumanSolver();
+                    result = solver.Solve(state, solveConfig, 1000);
+                    stratLabel = "human";
+                }
+                else if (gctx.Strategy == SolverStrategy.Auto)
+                {
+                    // Auto: Cashfall gets its own satisficing solver; MCTS for low turns (≤4), Iterative otherwise.
                     // Beam search plans 15 turns ahead assuming perfect PRNG — fiction in practice.
                     // Iterative with move ordering finds better first moves and respects PRNG reality.
-                    if (turnsLeft <= 4)
+                    if (solveConfig.Title != null && solveConfig.Title.Contains("Cashfall", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int budgetMs = 5000;
+                        Console.WriteLine($"[*] Auto-selected CashfallSolver (target={solveConfig.TargetScore})");
+                        ISolver solver = new CashfallSolver();
+                        var solveTask = Task.Run(() => solver.Solve(state, solveConfig, budgetMs));
+                        var completed = await Task.WhenAny(solveTask, Task.Delay(budgetMs + 2000));
+                        result = completed == solveTask
+                            ? await solveTask
+                            : new SolverResult { BestMoves = new List<SolverMove>(), PredictedScore = 0, StatesExplored = 0, Strategy = "timeout" };
+                        if (completed != solveTask) Console.WriteLine("[!] Solver hard timeout");
+                        stratLabel = "cashfall";
+                    }
+                    else if (turnsLeft <= 4)
                     {
                         int budgetMs = 5000; // more time for few turns
                         ISolver solver = new MCTSSolver();
@@ -305,6 +328,25 @@ void OnNewGame(int sessionId, Match3Config config)
                         stratLabel = "iterative";
                     }
                 }
+                else if (gctx.Strategy == SolverStrategy.Farming)
+                {
+                    // Farming: maximize item value while staying under score cap
+                    int budgetMs = turnsLeft switch
+                    {
+                        >= 12 => 7000,
+                        >= 8  => 5000,
+                        _     => 4000,
+                    };
+                    var farmSolver = new FarmingSolver { ScoreCap = gctx.ScoreCap };
+                    ISolver solver = farmSolver;
+                    var solveTask = Task.Run(() => solver.Solve(state, solveConfig, budgetMs));
+                    var completed = await Task.WhenAny(solveTask, Task.Delay(budgetMs + 2000));
+                    result = completed == solveTask
+                        ? await solveTask
+                        : new SolverResult { BestMoves = new List<SolverMove>(), PredictedScore = 0, StatesExplored = 0, Strategy = "timeout" };
+                    if (completed != solveTask) Console.WriteLine("[!] Solver hard timeout");
+                    stratLabel = "farming";
+                }
                 else
                 {
                     // Explicit strategy
@@ -327,9 +369,6 @@ void OnNewGame(int sessionId, Match3Config config)
 
                 sw.Stop();
                 result.SolveTime = sw.Elapsed;
-                SolverStats.RecordSolve(stratLabel, result.PredictedScore, sw.ElapsedMilliseconds);
-                session.Solution = result;
-                session.Status = SolveStatus.Solved;
 
                 // Timeout fallback: quick depth-1 solve
                 if (result.BestMoves.Count == 0 && turnsLeft > 0)
@@ -356,6 +395,11 @@ void OnNewGame(int sessionId, Match3Config config)
                         }
                     }
                 }
+
+                // Update session AFTER fallback so dashboard never sees empty/zero result
+                SolverStats.RecordSolve(stratLabel, result.PredictedScore, sw.ElapsedMilliseconds);
+                session.Solution = result;
+                session.Status = SolveStatus.Solved;
 
                 if (result.BestMoves.Count == 0)
                 {
@@ -409,6 +453,10 @@ void OnNewGame(int sessionId, Match3Config config)
                     break;
                 }
 
+                // Save pre-move state for fill-order diagnosis
+                var preDiagBoard = (int[])curPieces.Clone();
+                var preDiagRng = (MonoRandom)curRng.Clone();
+
                 // Execute only the FIRST move
                 bool success = await GameAutoPlayer.ExecuteSingleMove(firstMove, config, () =>
                 {
@@ -420,6 +468,18 @@ void OnNewGame(int sessionId, Match3Config config)
                 {
                     session.ConsecutiveFailures = 0;
                     MoveLog.LogMove(settingsDir, session.SessionId, turnsLeft, result.PredictedScore, firstMove, curPieces);
+
+                    // Diagnose fill order: read actual post-move board and compare strategies
+                    var postRead = QuickReadBoard(config);
+                    if (postRead != null)
+                        DiagnoseFillOrder(preDiagBoard, preDiagRng, firstMove, postRead.Value.pieces, config);
+
+                    // Human mode: pause after watching the cascade, like a real player scanning the new board
+                    if (gctx.Strategy == SolverStrategy.Human)
+                    {
+                        int postMoveDelay = new Random().Next(400, 1200);
+                        await Task.Delay(postMoveDelay);
+                    }
                 }
 
                 if (!success)
@@ -1018,6 +1078,152 @@ ProcessMemory? EnsureGameConnection()
     }
 }
 
+// ── Fill Order Diagnosis ──
+// Simulates swap + match + gravity WITHOUT filling, then tries different fill orders
+// against the actual post-move board to discover the game's real fill sequence.
+void DiagnoseFillOrder(int[] preBoard, MonoRandom preRng, SolverMove move, int[] actualPostBoard, Match3Config cfg)
+{
+    int w = cfg.Width, h = cfg.Height;
+
+    // Simulate swap
+    var board = (int[])preBoard.Clone();
+    var target = SimBoard.DeltaByDir(move.X, move.Y, move.Direction);
+    (board[move.Y * w + move.X], board[target.Y * w + target.X]) =
+        (board[target.Y * w + target.X], board[move.Y * w + move.X]);
+
+    // We need to run full cascade steps (match → remove → gravity → fill) using a known PRNG
+    // but with different fill orders. For each cascade step:
+    // 1. Find matches, mark dead
+    // 2. Gravity: compact non-dead pieces downward
+    // 3. Record which cells are empty (need filling)
+    // 4. The fill order of these cells determines PRNG consumption
+
+    // Define fill order strategies
+    var strategies = new (string name, Func<int, int, List<(int x, int y)>> getOrder)[]
+    {
+        ("L→R bottom→top (current)", (w, h) => {
+            var cells = new List<(int x, int y)>();
+            for (int x = 0; x < w; x++) for (int y = 0; y < h; y++) cells.Add((x, y));
+            return cells;
+        }),
+        ("L→R top→bottom", (w, h) => {
+            var cells = new List<(int x, int y)>();
+            for (int x = 0; x < w; x++) for (int y = h - 1; y >= 0; y--) cells.Add((x, y));
+            return cells;
+        }),
+        ("R→L bottom→top", (w, h) => {
+            var cells = new List<(int x, int y)>();
+            for (int x = w - 1; x >= 0; x--) for (int y = 0; y < h; y++) cells.Add((x, y));
+            return cells;
+        }),
+        ("R→L top→bottom", (w, h) => {
+            var cells = new List<(int x, int y)>();
+            for (int x = w - 1; x >= 0; x--) for (int y = h - 1; y >= 0; y--) cells.Add((x, y));
+            return cells;
+        }),
+        ("bottom→top L→R (row-major)", (w, h) => {
+            var cells = new List<(int x, int y)>();
+            for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) cells.Add((x, y));
+            return cells;
+        }),
+        ("top→bottom L→R (row-major)", (w, h) => {
+            var cells = new List<(int x, int y)>();
+            for (int y = h - 1; y >= 0; y--) for (int x = 0; x < w; x++) cells.Add((x, y));
+            return cells;
+        }),
+    };
+
+    int activePieces = preBoard.Max() + 1;
+    Console.WriteLine($"[diag] Fill order diagnosis: move ({move.X},{move.Y}) {move.Direction}, activePieces={activePieces}");
+
+    // Test PRNG offsets: advance PRNG by N calls before simulating
+    int[] offsets = { 0, 1, 2, 3, -1, -2 };
+
+    foreach (int prngOffset in offsets)
+    {
+        // Clone board and PRNG fresh
+        var testBoard = (int[])preBoard.Clone();
+        var testRng = (MonoRandom)preRng.Clone();
+
+        // Apply PRNG offset
+        if (prngOffset > 0)
+            for (int i = 0; i < prngOffset; i++) testRng.Next(activePieces);
+        // For negative offset, we can't rewind — skip (only test >= 0)
+        if (prngOffset < 0) continue;
+
+        // Swap
+        (testBoard[move.Y * w + move.X], testBoard[target.Y * w + target.X]) =
+            (testBoard[target.Y * w + target.X], testBoard[move.Y * w + move.X]);
+
+        // Run cascade: match → remove → gravity → fill (L→R bottom→top)
+        int steps = 0;
+        while (true)
+        {
+            var dead = new bool[w * h];
+            bool anyMatch = false;
+            // Horizontal
+            for (int y = 0; y < h; y++)
+            {
+                int x = 0;
+                while (x < w)
+                {
+                    int t = testBoard[y * w + x];
+                    if (t < 0) { x++; continue; }
+                    int len = 1;
+                    while (x + len < w && testBoard[y * w + x + len] == t) len++;
+                    if (len >= 3) { for (int i = 0; i < len; i++) dead[y * w + x + i] = true; anyMatch = true; }
+                    x += len;
+                }
+            }
+            // Vertical
+            for (int x = 0; x < w; x++)
+            {
+                int y = 0;
+                while (y < h)
+                {
+                    int t = testBoard[y * w + x];
+                    if (t < 0) { y++; continue; }
+                    int len = 1;
+                    while (y + len < h && testBoard[(y + len) * w + x] == t) len++;
+                    if (len >= 3) { for (int i = 0; i < len; i++) dead[(y + i) * w + x] = true; anyMatch = true; }
+                    y += len;
+                }
+            }
+            if (!anyMatch) break;
+            steps++;
+
+            for (int i = 0; i < testBoard.Length; i++)
+                if (dead[i]) testBoard[i] = -1;
+
+            // Gravity
+            for (int x = 0; x < w; x++)
+            {
+                int writeY = 0;
+                for (int readY = 0; readY < h; readY++)
+                {
+                    int p = testBoard[readY * w + x];
+                    if (p >= 0) { testBoard[writeY * w + x] = p; writeY++; }
+                }
+                for (int y = writeY; y < h; y++)
+                    testBoard[y * w + x] = -1;
+            }
+
+            // Fill L→R bottom→top
+            for (int x = 0; x < w; x++)
+                for (int y = 0; y < h; y++)
+                    if (testBoard[y * w + x] == -1)
+                        testBoard[y * w + x] = testRng.Next(activePieces);
+        }
+
+        int mismatches = 0;
+        for (int i = 0; i < testBoard.Length; i++)
+            if (testBoard[i] != actualPostBoard[i]) mismatches++;
+
+        string verdict = mismatches == 0 ? "MATCH!" : $"{mismatches} mismatches";
+        Console.WriteLine($"[diag]   offset={prngOffset,-3} → {verdict} ({steps} cascade steps, {testRng.CallCount} PRNG calls)");
+    }
+}
+
 // ── Log Tail Loop ──
 async Task TailLog(CancellationToken ct)
 {
@@ -1235,8 +1441,16 @@ foreach (var arg in args)
         else Console.WriteLine($"[!] Unknown strategy: {val}. Using Auto.");
     }
     if (arg == "--autoloop") gctx.Autoloop = true;
+    if (arg.StartsWith("--scorecap="))
+    {
+        if (int.TryParse(arg.Substring("--scorecap=".Length), out int cap) && cap > 0)
+            gctx.ScoreCap = cap;
+        else Console.WriteLine($"[!] Invalid score cap: {arg}. Using default {gctx.ScoreCap}.");
+    }
 }
 Console.WriteLine($"[*] Solver strategy: {gctx.Strategy}");
+if (gctx.Strategy == SolverStrategy.Farming)
+    Console.WriteLine($"[*] Farming score cap: {gctx.ScoreCap}");
 
 var logTask = Task.Run(() => TailLog(cts.Token));
 var httpTask = Task.Run(() => RunHttpServer(cts.Token));
