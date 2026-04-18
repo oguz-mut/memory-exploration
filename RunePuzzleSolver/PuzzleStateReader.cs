@@ -119,13 +119,21 @@ public class PuzzleStateReader
     {
         if (_memory == null) return false;
 
-        // Quick validation of cached pointer
+        // Quick validation of cached pointer — same strictness as the scan itself,
+        // otherwise a pooled object that briefly matched could be kept alive.
         if (_ctrlPtr >= Offsets.MinValidPtr)
         {
             int codeLength = _memory.ReadInt32(_ctrlPtr + Offsets.RunePuzzleSubController.CodeLength);
             int numGuesses = _memory.ReadInt32(_ctrlPtr + Offsets.RunePuzzleSubController.NumGuessesAllowed);
             if (codeLength >= 3 && codeLength <= 8 && numGuesses >= 5 && numGuesses <= 20)
-                return true;
+            {
+                ulong inputListPtr = _memory.ReadPointer(_ctrlPtr + Offsets.RunePuzzleSubController.InputDisplayButtons);
+                if (inputListPtr >= Offsets.MinValidPtr)
+                {
+                    int inputCount = _memory.ReadInt32(inputListPtr + Offsets.IL2CppList.Size);
+                    if (inputCount == codeLength) return true;
+                }
+            }
             _ctrlPtr = 0;
         }
 
@@ -175,12 +183,23 @@ public class PuzzleStateReader
                         ulong method0 = _memory.ReadPointer(vtable);
                         if (method0 < Offsets.MinValidPtr) continue;
 
-                        // PuzzleWindow at +0x20 must be a valid heap pointer
+                        // PuzzleWindow at +0x20 must be a valid heap pointer AND activeSelf=true
                         ulong windowPtr = BitConverter.ToUInt64(chunk, i + Offsets.RunePuzzleSubController.PuzzleWindow);
                         if (windowPtr < Offsets.MinValidPtr) continue;
+                        byte activeSelf = _memory.ReadByte(windowPtr + Offsets.GameObject.ActiveSelf);
+                        if (activeSelf == 0) continue;
+
+                        // DEFINITIVE CHECK: inputDisplayButtons.Count must equal codeLength.
+                        // The game populates this list only when a puzzle is actively shown,
+                        // and its size exactly matches the code length. Filters out pooled/
+                        // prefab objects left over from previous puzzles of different lengths.
+                        ulong inputListPtr = BitConverter.ToUInt64(chunk, i + Offsets.RunePuzzleSubController.InputDisplayButtons);
+                        if (inputListPtr < Offsets.MinValidPtr) continue;
+                        int inputCount = _memory.ReadInt32(inputListPtr + Offsets.IL2CppList.Size);
+                        if (inputCount != codeLength) continue;
 
                         ulong ctrlPtr = readAddr + (ulong)i;
-                        Console.WriteLine($"[reader] found at 0x{ctrlPtr:X}");
+                        Console.WriteLine($"[reader] found at 0x{ctrlPtr:X} (codeLength={codeLength}, numGuesses={numGuesses}, inputs={inputCount})");
                         return ctrlPtr;
                     }
                 }
