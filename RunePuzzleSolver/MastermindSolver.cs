@@ -18,7 +18,7 @@ public class MastermindSolver
         int? pinnedCodeLength = null;
         List<int[]> candidates = [];
         List<(int[] guess, int wrongPos, int rightPos)> localHistory = [];
-        int guessesSent = 0;
+        bool guessPending = false;  // true after we submit until history count grows
 
         await foreach (PuzzleState state in input.Reader.ReadAllAsync(ct))
         {
@@ -28,7 +28,7 @@ public class MastermindSolver
                 pinnedCodeLength = null;
                 candidates = [];
                 localHistory = [];
-                guessesSent = 0;
+                guessPending = false;
                 continue;
             }
 
@@ -39,7 +39,7 @@ public class MastermindSolver
                 pinnedCodeLength = state.CodeLength;
                 candidates = GenerateAllCodes(12, state.CodeLength);
                 localHistory = [];
-                guessesSent = 0;
+                guessPending = false;
                 CandidateCount = candidates.Count;
                 SolverStatus = $"ready — {candidates.Count} candidates for length {state.CodeLength}";
                 Console.WriteLine($"[solver] New puzzle length={state.CodeLength}, {candidates.Count} candidates");
@@ -51,7 +51,8 @@ public class MastermindSolver
 
             int len = pinnedCodeLength.Value;
 
-            // Prune from state history (ground truth). Skip malformed entries.
+            // Prune from state history (ground truth). This also handles resuming
+            // a mid-game puzzle: pre-existing entries get adopted and pruned normally.
             if (state.History.Count > localHistory.Count)
             {
                 foreach (var entry in state.History.Skip(localHistory.Count))
@@ -73,6 +74,7 @@ public class MastermindSolver
                 CandidateCount = candidates.Count;
                 SolverStatus = $"pruned to {candidates.Count} candidates";
                 Console.WriteLine($"[solver] {SolverStatus}");
+                guessPending = false;  // history grew — our previous submission (if any) landed
             }
 
             // Check if solved
@@ -83,16 +85,16 @@ public class MastermindSolver
                 continue;
             }
 
-            // Send next guess ONLY when the game has caught up with what we sent.
-            // guessesSent==localHistory.Count means every guess we sent is reflected
-            // in the game's history. If they differ, the game has not processed our
-            // last click-submit yet — wait instead of spamming duplicates.
-            if (guessesSent == localHistory.Count && candidates.Count > 0)
+            // Send a guess when nothing is currently pending. This gate prevents
+            // spamming duplicates while still allowing mid-puzzle resume: if we
+            // attach to a puzzle that already has 3 guesses, the pruning loop
+            // above consumes them, guessPending stays false, and we send #4.
+            if (!guessPending && candidates.Count > 0)
             {
                 var next = ComputeNextGuess(candidates, len);
                 Console.WriteLine($"[solver] candidates={CandidateCount} next=[{string.Join(",", next)}]");
                 await ActionChannel.Writer.WriteAsync(new GuessAction(next), ct);
-                guessesSent++;
+                guessPending = true;
             }
         }
     }
