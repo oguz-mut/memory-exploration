@@ -73,7 +73,8 @@ var parserTask = Task.Run(async () =>
     }
 });
 
-// Decision task — watches lastState.Signature; fires solver+clicker when it changes.
+// Decision task — watches lastState.Signature; re-analyzes from scratch on every change.
+// Narrates: state → options → decision → plan → execute → verify.
 var decisionTask = Task.Run(async () =>
 {
     string lastSig = "";
@@ -86,14 +87,58 @@ var decisionTask = Task.Run(async () =>
         forceRedecide = false;
         lastSig = s.Signature;
 
+        // Let the UI settle (dice animation finishing etc.) before deciding.
+        await Task.Delay(500, cts.Token);
+        // Re-read in case state advanced during settle-wait.
+        s = lastState ?? s;
+        lastSig = s.Signature;
+
+        // ── ANALYZE ──────────────────────────────────────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine("──────────────────────────────────────────────────────────────");
+        Console.WriteLine($"[analyze] phase={s.Phase} sig={s.Signature}");
+        if (s.Phase == GamePhase.Playing)
+        {
+            int pscore = (s.RedDice.Length > 0 ? s.RedDice.Sum() : 0) - (s.Raised ? 1 : 0);
+            Console.WriteLine($"[analyze]   red dice: [{string.Join(",", s.RedDice)}] = {pscore}{(s.Raised ? " (incl -1 hubris)" : "")}");
+            Console.WriteLine($"[analyze]   dealer current: {s.DealerCurScore} (will add 2d6, expect +7)");
+            Console.WriteLine($"[analyze]   raised: {s.Raised}  losing banner: {s.LosingBanner}");
+            Console.WriteLine($"[analyze]   options: [{string.Join(",", s.AvailableResponseCodes)}]");
+        }
+        else if (s.Phase == GamePhase.Result)
+        {
+            Console.WriteLine($"[analyze]   {(s.Won ? "WON" : "LOST")} with blues [{string.Join(",", s.BluesRolled)}]");
+        }
+
+        // ── DECIDE ───────────────────────────────────────────────────────────
         var decision = solver.Decide(s);
         lastDecision = decision;
-        Console.WriteLine($"[main] {s.Phase} -> {decision.Action} (code {decision.ResponseCode}) EV={decision.EV:+#;-#;0} p={decision.WinProbability:P1} :: {decision.Rationale}");
-        if (autoPlay && decision.Action != DiceAction.NoOp && decision.ResponseCode != 0)
+        Console.WriteLine($"[decide] {decision.Action} (code {decision.ResponseCode})  EV={decision.EV:+#;-#;0}  p(win)={decision.WinProbability:P1}");
+        Console.WriteLine($"[decide]   rationale: {decision.Rationale}");
+
+        if (!autoPlay)
         {
-            try { await clicker.ClickResponseCodeAsync(decision.ResponseCode, s, cts.Token); }
-            catch (Exception ex) { Console.WriteLine($"[main] click failed: {ex.Message}"); }
+            Console.WriteLine("[plan] autoplay OFF — waiting for manual input");
+            continue;
         }
+        if (decision.Action == DiceAction.NoOp || decision.ResponseCode == 0)
+        {
+            Console.WriteLine("[plan] no actionable decision");
+            continue;
+        }
+
+        // ── EXECUTE ──────────────────────────────────────────────────────────
+        try
+        {
+            await clicker.ClickResponseCodeAsync(decision.ResponseCode, s, cts.Token);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[execute] click failed: {ex.Message}");
+        }
+
+        // Pause a moment so the next iteration's analyze prints after all post-click logs.
+        await Task.Delay(200, cts.Token);
     }
 });
 

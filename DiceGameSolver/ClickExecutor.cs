@@ -43,8 +43,8 @@ public class ClickExecutor
 {
     public string ExecutorStatus { get; private set; } = "idle";
     public ClickCalibration? Calibration { get; private set; }
-    public int PostClickDelayMs { get; set; } = 2000;  // max wait for state advance per attempt
-    public int DismissDelayMs { get; set; } = 300;
+    public int PostClickDelayMs { get; set; } = 3000;  // max wait for state advance per attempt
+    public int DismissDelayMs { get; set; } = 800;
     public int MaxRetries { get; set; } = 3;
 
     /// <summary>Optional learned positions; consulted before calibration fallback.</summary>
@@ -453,21 +453,27 @@ public class ClickExecutor
         bool usingLearned = learned.HasValue;
         LastClickUsedLearned = usingLearned;
 
-        if (usingLearned)
-            Console.WriteLine($"[clicker] using learned position for {layoutKey}/{responseCode} @ ({learned!.Value.X},{learned.Value.Y})");
-
-        if (currentState.Phase == GamePhase.Playing && responseCode == GameState.CodeStandPat && !usingLearned && Calibration.StandPatSkipped)
-            Console.WriteLine("[clicker] WARNING: Stand Pat not calibrated — using Roll1 position (reduced EV)");
-
         var target = (usingLearned ? learned : calibratedTarget)!.Value;
         var preSig = currentState.Signature;
 
-        Console.WriteLine($"[clicker] START phase={currentState.Phase} code={responseCode} learned={usingLearned} dismiss=({Calibration.Dismiss.X},{Calibration.Dismiss.Y}) target=({target.X},{target.Y})");
-        Console.WriteLine($"[clicker] preSig: {preSig}");
+        // ── PLAN ─────────────────────────────────────────────────────────────
+        int obsCount = 0;
+        if (usingLearned && LearnedPositions is not null)
+            LearnedPositions.CoverageCounts().TryGetValue((layoutKey, responseCode), out obsCount);
+        string source = usingLearned ? $"learned median of {obsCount}" : "calibrated fallback";
+        Console.WriteLine($"[plan] target: code={responseCode} at ({target.X},{target.Y}) [{source}]");
+        Console.WriteLine($"[plan] preSig: {preSig}");
 
+        if (currentState.Phase == GamePhase.Playing && responseCode == GameState.CodeStandPat && !usingLearned && Calibration.StandPatSkipped)
+            Console.WriteLine("[plan] WARN: Stand Pat not calibrated — falling back to Roll1 position");
+
+        // ── EXECUTE ──────────────────────────────────────────────────────────
+        Console.WriteLine("[execute] 1/3: focus game window");
         FocusGameWindow();
+        await Task.Delay(200, ct);
+
+        Console.WriteLine($"[execute] 2/3: dismiss overlay at ({Calibration.Dismiss.X},{Calibration.Dismiss.Y})");
         ClickObserver.SetSuppressed();
-        Console.WriteLine($"[clicker] clicking dismiss ({Calibration.Dismiss.X},{Calibration.Dismiss.Y})");
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
 
@@ -485,16 +491,19 @@ public class ClickExecutor
         {
             int dy = yOffsets[Math.Min(attempt - 1, yOffsets.Length - 1)];
             var actual = new System.Drawing.Point(target.X, target.Y + dy);
-            ExecutorStatus = $"attempt {attempt}/{maxAttempts} phase={currentState.Phase} code={responseCode} dy={dy}";
-            Console.WriteLine($"[clicker] attempt {attempt}/{maxAttempts}: click target ({actual.X},{actual.Y}) dy={dy}");
+            string dyLabel = dy == 0 ? "center" : (dy > 0 ? $"+{dy}px" : $"{dy}px");
+            ExecutorStatus = $"attempt {attempt}/{maxAttempts} code={responseCode} dy={dy}";
+            Console.WriteLine($"[execute] 3/3: click attempt {attempt}/{maxAttempts} at ({actual.X},{actual.Y}) [{dyLabel}]");
+
             ClickObserver.SetSuppressed();
             GetCursorPos(out var preCursor);
             ClickAt(actual);
             GetCursorPos(out var postCursor);
-            if (preCursor.X != actual.X || preCursor.Y != actual.Y)
-                Console.WriteLine($"[clicker]   cursor {preCursor.X},{preCursor.Y} -> {postCursor.X},{postCursor.Y} (expected {actual.X},{actual.Y})");
+            if (postCursor.X != actual.X || postCursor.Y != actual.Y)
+                Console.WriteLine($"[execute]   cursor landed at ({postCursor.X},{postCursor.Y}) — expected ({actual.X},{actual.Y}) — possible focus issue");
 
-            // Poll for state advance (signature change) up to PostClickDelayMs
+            // ── VERIFY ──────────────────────────────────────────────────────
+            Console.WriteLine($"[verify] waiting up to {PostClickDelayMs}ms for state to advance...");
             var deadline = DateTime.UtcNow.AddMilliseconds(PostClickDelayMs);
             while (DateTime.UtcNow < deadline)
             {
@@ -502,27 +511,28 @@ public class ClickExecutor
                 var latest = LatestStateProvider?.Invoke();
                 if (latest is not null && latest.Signature != preSig)
                 {
-                    Console.WriteLine($"[clicker] ADVANCED after {attempt} attempt(s) dy={dy} -> {latest.Signature}");
-                    // Self-record the winning position so subsequent clicks go direct.
+                    Console.WriteLine($"[verify] ✓ advanced after attempt {attempt} [dy={dy}] -> {latest.Phase}");
+                    Console.WriteLine($"[verify]   new sig: {latest.Signature}");
                     LearnedPositions?.Record(layoutKey, responseCode, actual);
                     LearnedPositions?.Save();
-                    Console.WriteLine($"[clicker] learned {layoutKey}/{responseCode} @ ({actual.X},{actual.Y}) from successful auto-click");
+                    Console.WriteLine($"[verify]   learned {layoutKey}/{responseCode} @ ({actual.X},{actual.Y})");
                     ExecutorStatus = "idle";
                     return;
                 }
             }
 
-            Console.WriteLine($"[clicker] attempt {attempt} no advance, state still {preSig}");
-            // On retry, re-dismiss in case a dice overlay re-appeared
+            Console.WriteLine($"[verify] ✗ no advance after {PostClickDelayMs}ms, still at {preSig}");
             if (attempt < maxAttempts)
             {
+                int nextDy = yOffsets[Math.Min(attempt, yOffsets.Length - 1)];
+                Console.WriteLine($"[retry] re-dismiss and try dy={nextDy}px");
                 ClickObserver.SetSuppressed();
                 ClickAt(Calibration.Dismiss);
                 await Task.Delay(DismissDelayMs, ct);
             }
         }
 
-        Console.WriteLine($"[clicker] STUCK: {maxAttempts} attempts exhausted at {preSig}");
+        Console.WriteLine($"[verify] STUCK: all {maxAttempts} attempts failed, state never advanced from {preSig}");
         ExecutorStatus = $"STUCK at {preSig}";
     }
 }
