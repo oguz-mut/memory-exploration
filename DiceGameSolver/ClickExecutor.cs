@@ -471,15 +471,14 @@ public class ClickExecutor
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
 
-        // Y-offset scan: Result screens shift buttons by variable rows.
-        // When using a learned position, we Y-scan from the learned Y (not calibrated Y).
-        // For non-Result phases with learned position, cap attempts at 1 (fast path).
+        // Y-offset scan — stale calibration / body-length variation. Applied to ALL phases
+        // because the dialog can move between sessions. Result gets a denser scan.
         var yOffsets = currentState.Phase == GamePhase.Result
-            ? new[] { 0, -40, +40, -80, +80 }
-            : new[] { 0, 0, 0, 0, 0 };
+            ? new[] { 0, -40, +40, -80, +80, -120, +120 }
+            : new[] { 0, -40, +40, -80, +80 };
 
         int maxAttempts = usingLearned
-            ? (currentState.Phase == GamePhase.Result ? yOffsets.Length : 1)
+            ? 3                 // trust learned Y mostly, but allow a couple of scans if wrong
             : MaxRetries;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
@@ -489,7 +488,11 @@ public class ClickExecutor
             ExecutorStatus = $"attempt {attempt}/{maxAttempts} phase={currentState.Phase} code={responseCode} dy={dy}";
             Console.WriteLine($"[clicker] attempt {attempt}/{maxAttempts}: click target ({actual.X},{actual.Y}) dy={dy}");
             ClickObserver.SetSuppressed();
+            GetCursorPos(out var preCursor);
             ClickAt(actual);
+            GetCursorPos(out var postCursor);
+            if (preCursor.X != actual.X || preCursor.Y != actual.Y)
+                Console.WriteLine($"[clicker]   cursor {preCursor.X},{preCursor.Y} -> {postCursor.X},{postCursor.Y} (expected {actual.X},{actual.Y})");
 
             // Poll for state advance (signature change) up to PostClickDelayMs
             var deadline = DateTime.UtcNow.AddMilliseconds(PostClickDelayMs);
@@ -500,6 +503,10 @@ public class ClickExecutor
                 if (latest is not null && latest.Signature != preSig)
                 {
                     Console.WriteLine($"[clicker] ADVANCED after {attempt} attempt(s) dy={dy} -> {latest.Signature}");
+                    // Self-record the winning position so subsequent clicks go direct.
+                    LearnedPositions?.Record(layoutKey, responseCode, actual);
+                    LearnedPositions?.Save();
+                    Console.WriteLine($"[clicker] learned {layoutKey}/{responseCode} @ ({actual.X},{actual.Y}) from successful auto-click");
                     ExecutorStatus = "idle";
                     return;
                 }

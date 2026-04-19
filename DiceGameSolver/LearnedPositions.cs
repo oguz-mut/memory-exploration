@@ -33,16 +33,18 @@ public sealed class LearnedPositions
 
     // ── Read ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Returns the running-average position, or null if no data.</summary>
+    /// <summary>Returns the median position (robust to outliers), or null if no data.</summary>
     public System.Drawing.Point? Lookup(string layoutKey, int responseCode)
     {
         lock (_sync)
         {
             if (!_map.TryGetValue((layoutKey, responseCode), out var list) || list.Count == 0)
                 return null;
-            int avgX = (int)list.Average(p => p.X);
-            int avgY = (int)list.Average(p => p.Y);
-            return new System.Drawing.Point(avgX, avgY);
+            var xs = list.Select(p => p.X).OrderBy(v => v).ToArray();
+            var ys = list.Select(p => p.Y).OrderBy(v => v).ToArray();
+            int mx = xs[xs.Length / 2];
+            int my = ys[ys.Length / 2];
+            return new System.Drawing.Point(mx, my);
         }
     }
 
