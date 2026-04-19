@@ -477,19 +477,21 @@ public class ClickExecutor
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
 
-        // Offset scan — dialog can shift between sessions. We scan Y (primary axis) then X.
-        // Each entry is a (dx, dy) offset from target. Dense scan covers ±160 Y and ±30 X.
+        // Offset scan — dialog can shift within a row (~40px tall buttons).
+        // Stay INSIDE the current button row first (±20 covers typical drift).
+        // Then try adjacent rows (±40, ±80...) — but validate post-phase so adjacent-button
+        // hits are rejected rather than silently recorded as correct.
         var offsets = new List<(int dx, int dy)>
         {
             (0, 0),
-            (0, -40), (0, +40),
+            (0, -20), (0, +20),          // within-row drift
+            (0, -40), (0, +40),          // adjacent row (risk wrong button — validator catches)
             (0, -80), (0, +80),
             (0, -120), (0, +120),
-            (0, -160), (0, +160),
-            // Final fallback: small X drift combined with Y offsets
+            // X nudges with Y=0 (horizontal drift)
             (-30, 0), (+30, 0),
-            (-30, -40), (+30, -40),
-            (-30, +40), (+30, +40),
+            (+30, -20), (-30, -20),
+            (+30, +20), (-30, +20),
         };
 
         int maxAttempts = offsets.Count;  // exhaust the full scan before giving up
@@ -518,7 +520,17 @@ public class ClickExecutor
                 var latest = LatestStateProvider?.Invoke();
                 if (latest is not null && latest.Signature != preSig)
                 {
-                    Console.WriteLine($"[verify] ✓ advanced after attempt {attempt} [dy={dy}] -> {latest.Phase}");
+                    // Validate we hit the INTENDED button, not an adjacent one.
+                    var expected = GameState.ExpectedNextPhase(currentState, responseCode);
+                    if (expected.HasValue && latest.Phase != expected.Value)
+                    {
+                        Console.WriteLine($"[verify] ⚠ WRONG BUTTON: clicked code={responseCode} expecting {expected} but got {latest.Phase}");
+                        Console.WriteLine($"[verify]   NOT recording ({actual.X},{actual.Y}) — click hit an adjacent button");
+                        Console.WriteLine($"[verify]   stopping scan; next cycle will handle the new state");
+                        ExecutorStatus = $"wrong-button {currentState.Phase}->{latest.Phase}";
+                        return;
+                    }
+                    Console.WriteLine($"[verify] ✓ advanced after attempt {attempt} [dx={dx} dy={dy}] -> {latest.Phase}");
                     Console.WriteLine($"[verify]   new sig: {latest.Signature}");
                     LearnedPositions?.Record(layoutKey, responseCode, actual);
                     LearnedPositions?.Save();

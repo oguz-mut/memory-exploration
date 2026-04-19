@@ -25,4 +25,26 @@ public sealed class GameState
     public const int CodeCashOut = 111;     // Cash Out on win
     public const int CodePlayAgainWin = 112;// Play Again on win
     public const int CodeClose = -1;        // Close from cash-out screen
+
+    /// <summary>
+    /// What phase should we expect after clicking this code from this state?
+    /// Returns null if the combination isn't meaningful (we don't validate).
+    /// </summary>
+    public static GamePhase? ExpectedNextPhase(GameState pre, int code)
+    {
+        return (pre.Phase, code) switch
+        {
+            (GamePhase.Intro,   CodePlay)          => GamePhase.Playing,
+            (GamePhase.Playing, CodeRaise)         => GamePhase.Playing,   // still playing, now raised
+            (GamePhase.Playing, CodeRollOne)       => GamePhase.Result,
+            (GamePhase.Playing, CodeRollTwo)       => GamePhase.Result,
+            (GamePhase.Playing, CodeStandPat)      => GamePhase.Result,
+            (GamePhase.Result,  CodeCashOut)       => GamePhase.CashOut,
+            (GamePhase.Result,  CodePlayAgainWin)  => GamePhase.Playing,
+            (GamePhase.Result,  CodePlay)          => GamePhase.Playing,   // lost, play again
+            (GamePhase.CashOut, CodePlay)          => GamePhase.Playing,
+            (GamePhase.CashOut, CodeClose)         => GamePhase.Inactive,
+            _ => null,
+        };
+    }
 }
