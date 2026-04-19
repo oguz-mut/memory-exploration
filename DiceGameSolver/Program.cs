@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 // --selftest-* flags
@@ -19,10 +20,12 @@ if (args.Contains("--recalibrate"))
     if (File.Exists(cal)) File.Delete(cal);
 }
 
-var watcher = new LogWatcher();
-var parser  = new GameStateParser();
-var solver  = new DiceSolver { StopOnIntro = args.Contains("--stop-on-intro") };
-var clicker = new ClickExecutor();
+var watcher          = new LogWatcher();
+var parser           = new GameStateParser();
+var solver           = new DiceSolver { StopOnIntro = args.Contains("--stop-on-intro") };
+var clicker          = new ClickExecutor();
+var learnedPositions = LearnedPositions.Load();
+var observer         = new ClickObserver();
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -31,12 +34,21 @@ Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 GameState? lastState    = null;
 Decision?  lastDecision = null;
 int gamesPlayed = 0, gamesWon = 0, sessionProfit = 0;
-bool autoPlay   = false;
+bool autoPlay      = false;
+bool learnMode     = true;   // ON by default — record from first interaction
 bool forceRedecide = false;  // set when autoPlay flips ON so the current state gets re-evaluated
 var recentLines = new ConcurrentQueue<string>();
 
+// Wire up clicker with learned positions
 clicker.LatestStateProvider = () => lastState;
+clicker.LearnedPositions    = learnedPositions;
+
+observer.Enabled = learnMode;
+
 await clicker.CalibrateAsync(cts.Token);
+
+// Channel from parserTask → correlationTask carrying (state, arrivedAt)
+var stateChannel = Channel.CreateUnbounded<(GameState State, DateTime ArrivedAt)>();
 
 var tailTask = Task.Run(() => watcher.RunAsync(cts.Token));
 
@@ -56,6 +68,8 @@ var parserTask = Task.Run(async () =>
             if (m.Success && int.TryParse(m.Groups[1].Value, out var paid)) sessionProfit += paid;
         }
         lastState = state;
+        // Feed correlation task
+        stateChannel.Writer.TryWrite((state, DateTime.UtcNow));
     }
 });
 
@@ -83,6 +97,84 @@ var decisionTask = Task.Run(async () =>
     }
 });
 
+// Observer task — polls mouse button, feeds ObservationChannel
+var observerTask = Task.Run(() => observer.RunAsync(cts.Token));
+
+// Correlation task — matches clicks to state transitions and records learned positions
+var correlationTask = Task.Run(async () =>
+{
+    (GameState State, DateTime ArrivedAt)? prev = null;
+    var clickQ = new Queue<ClickEvent>();  // last 8 clicks
+
+    try
+    {
+        while (!cts.Token.IsCancellationRequested)
+        {
+            // Drain observation channel into local queue
+            while (observer.ObservationChannel.Reader.TryRead(out var click))
+            {
+                clickQ.Enqueue(click);
+                while (clickQ.Count > 8) clickQ.Dequeue();
+            }
+
+            // Process all pending state transitions
+            while (stateChannel.Reader.TryRead(out var entry))
+            {
+                var (newState, arrivedAt) = entry;
+
+                if (learnMode && prev.HasValue)
+                {
+                    // Most recent click that arrived between the previous and current state
+                    var match = clickQ
+                        .Where(c => c.TimestampUtc > prev.Value.ArrivedAt && c.TimestampUtc <= arrivedAt)
+                        .OrderByDescending(c => c.TimestampUtc)
+                        .FirstOrDefault();
+
+                    if (match is not null)
+                    {
+                        int? code = InferResponseCode(prev.Value.State, newState);
+                        if (code.HasValue)
+                        {
+                            var preState = prev.Value.State;
+                            if (preState.AvailableResponseCodes.Contains(code.Value))
+                            {
+                                var layoutKey = LayoutKey.For(preState);
+                                var pt = new System.Drawing.Point(match.X, match.Y);
+                                learnedPositions.Record(layoutKey, code.Value, pt);
+                                int age = (int)(arrivedAt - match.TimestampUtc).TotalMilliseconds;
+                                Console.WriteLine($"[learn] {layoutKey} code={code.Value} @ ({pt.X},{pt.Y}) from click {age}ms before transition");
+                                learnedPositions.Save();
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[learn] WARN: inferred code {code.Value} not in preState.AvailableResponseCodes [{string.Join(",", preState.AvailableResponseCodes)}], skipping");
+                            }
+                        }
+                    }
+                }
+
+                prev = (newState, arrivedAt);
+            }
+
+            await Task.Delay(50, cts.Token);
+        }
+    }
+    catch (OperationCanceledException) { }
+    catch (Exception ex) { Console.WriteLine($"[learn] correlation error: {ex.Message}"); }
+});
+
+// Periodic save every 60 s
+var periodicSaveTask = Task.Run(async () =>
+{
+    while (!cts.Token.IsCancellationRequested)
+    {
+        try { await Task.Delay(60_000, cts.Token); }
+        catch (OperationCanceledException) { break; }
+        learnedPositions.Save();
+        Console.WriteLine("[learn] periodic save");
+    }
+});
+
 var listener = new HttpListener();
 listener.Prefixes.Add("http://localhost:9883/");
 listener.Start();
@@ -99,6 +191,14 @@ var httpTask = Task.Run(async () =>
             {
                 autoPlay = !autoPlay;
                 if (autoPlay) forceRedecide = true;
+                ctx.Response.Redirect("/");
+                ctx.Response.Close();
+                continue;
+            }
+            if (ctx.Request.HttpMethod == "POST" && ctx.Request.Url?.AbsolutePath == "/learn")
+            {
+                learnMode = !learnMode;
+                observer.Enabled = learnMode;
                 ctx.Response.Redirect("/");
                 ctx.Response.Close();
                 continue;
@@ -123,7 +223,7 @@ var httpTask = Task.Run(async () =>
                 ctx.Response.Close();
                 continue;
             }
-            var html  = BuildDashboard(lastState, lastDecision, clicker, gamesPlayed, gamesWon, sessionProfit, autoPlay, recentLines);
+            var html  = BuildDashboard(lastState, lastDecision, clicker, gamesPlayed, gamesWon, sessionProfit, autoPlay, learnMode, learnedPositions, recentLines);
             var bytes = Encoding.UTF8.GetBytes(html);
             ctx.Response.ContentType = "text/html; charset=utf-8";
             ctx.Response.ContentLength64 = bytes.Length;
@@ -137,18 +237,41 @@ var httpTask = Task.Run(async () =>
     }
 });
 
-await Task.WhenAny(tailTask, parserTask, decisionTask, httpTask);
+await Task.WhenAny(tailTask, parserTask, decisionTask, httpTask, observerTask, correlationTask, periodicSaveTask);
+learnedPositions.Save();
+Console.WriteLine("[main] saved learned positions on shutdown");
 
+// ── Transition → response-code inference ────────────────────────────────────
+static int? InferResponseCode(GameState pre, GameState next) => (pre.Phase, next.Phase) switch
+{
+    (GamePhase.Intro,   GamePhase.Playing)                                      => GameState.CodePlay,
+    (GamePhase.Playing, GamePhase.Playing) when !pre.Raised && next.Raised      => GameState.CodeRaise,
+    (GamePhase.Playing, GamePhase.Result)  when next.BluesRolled.Length == 0    => GameState.CodeStandPat,
+    (GamePhase.Playing, GamePhase.Result)  when next.BluesRolled.Length == 1    => GameState.CodeRollOne,
+    (GamePhase.Playing, GamePhase.Result)  when next.BluesRolled.Length == 2    => GameState.CodeRollTwo,
+    (GamePhase.Result,  GamePhase.Playing) when pre.Won                         => GameState.CodePlayAgainWin,
+    (GamePhase.Result,  GamePhase.CashOut) when pre.Won                         => GameState.CodeCashOut,
+    (GamePhase.Result,  GamePhase.Playing) when !pre.Won                        => GameState.CodePlay,
+    (GamePhase.CashOut, GamePhase.Playing)                                      => GameState.CodePlay,
+    (GamePhase.CashOut, GamePhase.Intro) or (GamePhase.CashOut, GamePhase.Inactive) => GameState.CodeClose,
+    _ => null,
+};
+
+// ── Dashboard ────────────────────────────────────────────────────────────────
 static string BuildDashboard(
     GameState? s, Decision? d, ClickExecutor clicker,
     int gamesPlayed, int gamesWon, int sessionProfit,
-    bool autoPlay, ConcurrentQueue<string> recentLines)
+    bool autoPlay, bool learnMode, LearnedPositions learnedPositions,
+    ConcurrentQueue<string> recentLines)
 {
     var sb = new StringBuilder();
     double winRate = gamesPlayed > 0 ? (double)gamesWon / gamesPlayed * 100.0 : 0.0;
     string autoLabel = autoPlay ? "<span style='color:#4caf50'>ON</span>"  : "<span style='color:#f44336'>OFF</span>";
     string autoBtn   = autoPlay ? "DISABLE" : "ENABLE";
     string autoCls   = autoPlay ? "btn-on"  : "btn-off";
+    string learnLabel = learnMode ? "<span style='color:#4caf50'>ON</span>" : "<span style='color:#f44336'>OFF</span>";
+    string learnBtn   = learnMode ? "DISABLE" : "ENABLE";
+    string learnCls   = learnMode ? "btn-on"  : "btn-off";
 
     sb.Append("""
         <!DOCTYPE html><html><head><meta charset="utf-8">
@@ -176,13 +299,20 @@ static string BuildDashboard(
         .warn { color:#ffb300; }
         .good { color:#4caf50; }
         .bad  { color:#f44336; }
+        table.coverage { border-collapse:collapse; margin-top:8px; font-size:12px; }
+        table.coverage th { padding:3px 8px; color:#888; border-bottom:1px solid #0f3460; text-align:center; }
+        table.coverage th.layout-col { text-align:left; }
+        table.coverage td { padding:3px 8px; text-align:center; }
+        table.coverage td.layout-col { text-align:left; color:#a0c4ff; }
         </style></head><body>
         <h1>Dice Game Solver <span style='color:#666'>(:9883)</span></h1>
         """);
 
-    // Auto-play toggle + click-timing knobs
+    // Auto-play toggle + learn-mode toggle + click-timing knobs
     sb.Append($"<div class='panel'><b>Auto-Play:</b> {autoLabel} &nbsp;");
     sb.Append($"<form method='POST' action='/toggle'><button class='{autoCls}'>{autoBtn}</button></form>");
+    sb.Append($"&nbsp;&nbsp;&nbsp;<b>Learn-Mode:</b> {learnLabel} &nbsp;");
+    sb.Append($"<form method='POST' action='/learn'><button class='{learnCls}'>{learnBtn}</button></form>");
     sb.Append("<form method='POST' action='/delay' style='margin-top:10px'>");
     sb.Append($"&nbsp;&nbsp;<label>post-click wait (ms): <input type='number' name='post' min='0' max='10000' step='50' value='{clicker.PostClickDelayMs}' style='width:80px'></label>");
     sb.Append($"&nbsp;&nbsp;<label>dismiss wait (ms): <input type='number' name='dismiss' min='0' max='5000' step='50' value='{clicker.DismissDelayMs}' style='width:80px'></label>");
@@ -244,6 +374,45 @@ static string BuildDashboard(
         sb.Append($"Action: <b>{d.Action}</b> (code {d.ResponseCode})<br>");
         sb.Append($"EV: {evSign}{d.EV:F2} Councils &nbsp; Win%: {d.WinProbability:P1}<br>");
         sb.Append($"Rationale: {WebUtility.HtmlEncode(d.Rationale)}<br>");
+        if (clicker.LastClickUsedLearned)
+            sb.Append("<span class='good'>&#10003; learned position used</span><br>");
+    }
+    sb.Append("</div>");
+
+    // Learn coverage matrix
+    var coverage = learnedPositions.CoverageCounts();
+    var layoutKeys = coverage.Keys.Select(k => k.Item1).Distinct().OrderBy(k => k).ToList();
+    int[] relevantCodes = [-1, 1, 101, 111, 112, 121, 122, 123];
+    int totalObs      = coverage.Values.Sum();
+    int distinctCodes = coverage.Keys.Select(k => k.Item2).Distinct().Count();
+
+    sb.Append("<div class='panel'><b>Learn Coverage</b>&nbsp;");
+    sb.Append($"<span style='color:#888;font-size:12px'>{layoutKeys.Count} layout(s) &times; {distinctCodes} code(s) observed, {totalObs} total clicks recorded</span><br>");
+
+    if (layoutKeys.Count > 0)
+    {
+        sb.Append("<table class='coverage'><tr><th class='layout-col'>Layout</th>");
+        foreach (int code in relevantCodes)
+            sb.Append($"<th>{code}</th>");
+        sb.Append("</tr>");
+
+        foreach (var lk in layoutKeys)
+        {
+            sb.Append($"<tr><td class='layout-col'>{WebUtility.HtmlEncode(lk)}</td>");
+            foreach (int code in relevantCodes)
+            {
+                coverage.TryGetValue((lk, code), out int cnt);
+                string style = cnt >= 2 ? "color:#4caf50" : cnt == 1 ? "color:#ffb300" : "color:#333";
+                string cell  = cnt > 0 ? cnt.ToString() : "&middot;";
+                sb.Append($"<td style='{style}'>{cell}</td>");
+            }
+            sb.Append("</tr>");
+        }
+        sb.Append("</table>");
+    }
+    else
+    {
+        sb.Append("<span style='color:#888;font-size:12px'>No observations yet — play a round to start learning button positions.</span>");
     }
     sb.Append("</div>");
 
