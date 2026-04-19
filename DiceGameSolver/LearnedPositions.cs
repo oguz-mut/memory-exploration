@@ -40,12 +40,17 @@ public sealed class LearnedPositions
         {
             if (!_map.TryGetValue((layoutKey, responseCode), out var list) || list.Count == 0)
                 return null;
-            var xs = list.Select(p => p.X).OrderBy(v => v).ToArray();
-            var ys = list.Select(p => p.Y).OrderBy(v => v).ToArray();
-            int mx = xs[xs.Length / 2];
-            int my = ys[ys.Length / 2];
-            return new System.Drawing.Point(mx, my);
+            return new System.Drawing.Point(Median(list.Select(p => p.X)), Median(list.Select(p => p.Y)));
         }
+    }
+
+    static int Median(IEnumerable<int> vals)
+    {
+        var arr = vals.OrderBy(v => v).ToArray();
+        if (arr.Length == 0) return 0;
+        if (arr.Length % 2 == 1) return arr[arr.Length / 2];
+        // Even count: average the two middle values (true median, resists single-side outliers).
+        return (arr[arr.Length / 2 - 1] + arr[arr.Length / 2]) / 2;
     }
 
     /// <summary>
@@ -77,9 +82,7 @@ public sealed class LearnedPositions
                 {
                     bestDistance = dist;
                     bestSiblingIdx = i;
-                    var xs = list.Select(p => p.X).OrderBy(v => v).ToArray();
-                    var ys = list.Select(p => p.Y).OrderBy(v => v).ToArray();
-                    best = new System.Drawing.Point(xs[xs.Length / 2], ys[ys.Length / 2]);
+                    best = new System.Drawing.Point(Median(list.Select(p => p.X)), Median(list.Select(p => p.Y)));
                 }
             }
 

@@ -413,6 +413,39 @@ public class ClickExecutor
         return cal;
     }
 
+    /// <summary>
+    /// Poll SPACE (capture), S (skip), ESC (cancel) up to the timeout.
+    /// Returns the cursor position on SPACE, null on S or timeout, throws on ESC.
+    /// </summary>
+    static async Task<System.Drawing.Point?> WaitForRescueHotkeyAsync(CancellationToken ct, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        // Wait for both SPACE and S to be released (in case key was held from prior action).
+        while ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0 || (GetAsyncKeyState(VK_S) & 0x8000) != 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (DateTime.UtcNow > deadline) return null;
+            await Task.Delay(20, ct);
+        }
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+                throw new OperationCanceledException("Rescue cancelled by ESC");
+            if ((GetAsyncKeyState(VK_S) & 0x8000) != 0)
+                return null;
+            if ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0)
+            {
+                GetCursorPos(out var pt);
+                while ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0)
+                    await Task.Delay(20, ct);
+                return new System.Drawing.Point(pt.X, pt.Y);
+            }
+            await Task.Delay(30, ct);
+        }
+        return null;
+    }
+
     /// <summary>Given pre-state and the observed post-phase, infer which code was actually pressed.</summary>
     static int? InferHitCode(GameState pre, GamePhase postPhase)
     {
@@ -621,6 +654,52 @@ public class ClickExecutor
                 await Task.Delay(DismissDelayMs, ct);
             }
         }
+
+        // ── RESCUE MODE ──────────────────────────────────────────────────────
+        Console.WriteLine("");
+        Console.WriteLine($"[rescue] STUCK on {layoutKey}/{responseCode}");
+        Console.WriteLine($"[rescue] hover your cursor over the CORRECT button for code {responseCode} and press SPACE");
+        Console.WriteLine($"[rescue] ESC to cancel autoplay, S to skip this cycle");
+        Console.WriteLine($"[rescue] (waiting up to 60s)");
+        ExecutorStatus = $"RESCUE needed for {layoutKey}/{responseCode}";
+
+        try
+        {
+            var rescuePt = await WaitForRescueHotkeyAsync(ct, TimeSpan.FromSeconds(60));
+            if (rescuePt.HasValue)
+            {
+                Console.WriteLine($"[rescue] captured ({rescuePt.Value.X},{rescuePt.Value.Y}) — clicking and learning");
+                FocusGameWindow();
+                await Task.Delay(100, ct);
+                ClickObserver.SetSuppressed();
+                ClickAt(rescuePt.Value);
+                await Task.Delay(PostClickDelayMs, ct);
+                var latest = LatestStateProvider?.Invoke();
+                if (latest is not null && latest.Signature != preSig)
+                {
+                    var expected = GameState.ExpectedNextPhase(currentState, responseCode);
+                    if (!expected.HasValue || latest.Phase == expected.Value)
+                    {
+                        LearnedPositions?.Record(layoutKey, responseCode, rescuePt.Value);
+                        LearnedPositions?.Save();
+                        Console.WriteLine($"[rescue] ✓ advanced to {latest.Phase}; learned {layoutKey}/{responseCode} @ ({rescuePt.Value.X},{rescuePt.Value.Y})");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[rescue] ⚠ advanced but to {latest.Phase} (expected {expected}); NOT recording");
+                    }
+                    ExecutorStatus = "idle";
+                    return;
+                }
+                Console.WriteLine($"[rescue] click didn't advance state; continuing to give up");
+            }
+            else
+            {
+                Console.WriteLine($"[rescue] no SPACE received — giving up");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { Console.WriteLine($"[rescue] error: {ex.Message}"); }
 
         Console.WriteLine($"[verify] STUCK: all {maxAttempts} attempts failed, state never advanced from {preSig}");
         ExecutorStatus = $"STUCK at {preSig}";
