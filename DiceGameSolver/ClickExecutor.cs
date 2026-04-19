@@ -439,6 +439,15 @@ public class ClickExecutor
         var layoutKey = LayoutKey.For(currentState);
         var learned = LearnedPositions?.Lookup(layoutKey, responseCode);
 
+        // ── 1b. Sibling inference — if no direct learned data, compute from neighbor ──
+        System.Drawing.Point? inferred = null;
+        if (learned is null && LearnedPositions is not null)
+        {
+            inferred = LearnedPositions.LookupBySibling(layoutKey, responseCode, currentState.AvailableResponseCodes);
+            if (inferred.HasValue)
+                Console.WriteLine($"[plan] no direct learned — inferred target from sibling: ({inferred.Value.X},{inferred.Value.Y})");
+        }
+
         // ── 2. Calibration fallback ───────────────────────────────────────────
         System.Drawing.Point? calibratedTarget = (currentState.Phase, responseCode) switch
         {
@@ -455,7 +464,7 @@ public class ClickExecutor
             _ => (System.Drawing.Point?)null
         };
 
-        if (learned is null && calibratedTarget is null)
+        if (learned is null && inferred is null && calibratedTarget is null)
         {
             ExecutorStatus = $"WARNING: no mapping for phase={currentState.Phase} code={responseCode}";
             Console.WriteLine($"[clicker] {ExecutorStatus}");
@@ -463,16 +472,19 @@ public class ClickExecutor
         }
 
         bool usingLearned = learned.HasValue;
+        bool usingInferred = !usingLearned && inferred.HasValue;
         LastClickUsedLearned = usingLearned;
 
-        var target = (usingLearned ? learned : calibratedTarget)!.Value;
+        var target = (learned ?? inferred ?? calibratedTarget)!.Value;
         var preSig = currentState.Signature;
 
         // ── PLAN ─────────────────────────────────────────────────────────────
         int obsCount = 0;
         if (usingLearned && LearnedPositions is not null)
             LearnedPositions.CoverageCounts().TryGetValue((layoutKey, responseCode), out obsCount);
-        string source = usingLearned ? $"learned median of {obsCount}" : "calibrated fallback";
+        string source = usingLearned ? $"learned median of {obsCount}"
+                      : usingInferred ? "sibling-inferred"
+                      : "calibrated fallback";
         Console.WriteLine($"[plan] target: code={responseCode} at ({target.X},{target.Y}) [{source}]");
         Console.WriteLine($"[plan] preSig: {preSig}");
 
@@ -504,20 +516,20 @@ public class ClickExecutor
         if (!hasAbove && hasBelow)
         {
             // Safe to scan UP (nothing above). Dangerous to scan down (+40 = adjacent).
-            offsets.AddRange(new[] { (0, -40), (0, -80), (0, -120), (0, -160) });
+            offsets.AddRange(new[] { (0, -40), (0, -80), (0, -120), (0, -160), (0, -200), (0, -240) });
             // Only try below at big offsets that skip past the neighbor.
             offsets.AddRange(new[] { (0, +80), (0, +120), (0, +160) });
         }
         else if (hasAbove && !hasBelow)
         {
             // Safe to scan DOWN. Dangerous up.
-            offsets.AddRange(new[] { (0, +40), (0, +80), (0, +120), (0, +160) });
+            offsets.AddRange(new[] { (0, +40), (0, +80), (0, +120), (0, +160), (0, +200), (0, +240) });
             offsets.AddRange(new[] { (0, -80), (0, -120), (0, -160) });
         }
         else if (!hasAbove && !hasBelow)
         {
             // Only button — scan freely both directions.
-            offsets.AddRange(new[] { (0, -40), (0, +40), (0, -80), (0, +80), (0, -120), (0, +120) });
+            offsets.AddRange(new[] { (0, -40), (0, +40), (0, -80), (0, +80), (0, -120), (0, +120), (0, -160), (0, +160) });
         }
         else
         {
@@ -537,12 +549,27 @@ public class ClickExecutor
             ExecutorStatus = $"attempt {attempt}/{maxAttempts} code={responseCode} {label}";
             Console.WriteLine($"[execute] 3/3: click attempt {attempt}/{maxAttempts} at ({actual.X},{actual.Y}) [{label}]");
 
+            // Refresh focus EVERY attempt — stale focus is a silent failure mode.
+            FocusGameWindow();
+            await Task.Delay(100, ct);
+
             ClickObserver.SetSuppressed();
+            SetCursorPos(actual.X, actual.Y);
+            await Task.Delay(50, ct);  // let Windows actually move the cursor
             GetCursorPos(out var preCursor);
+            if (Math.Abs(preCursor.X - actual.X) > 3 || Math.Abs(preCursor.Y - actual.Y) > 3)
+            {
+                Console.WriteLine($"[execute]   ⚠ cursor failed to move to ({actual.X},{actual.Y}); actual ({preCursor.X},{preCursor.Y}) — retrying SetCursorPos");
+                SetCursorPos(actual.X, actual.Y);
+                await Task.Delay(100, ct);
+                GetCursorPos(out preCursor);
+                if (Math.Abs(preCursor.X - actual.X) > 3 || Math.Abs(preCursor.Y - actual.Y) > 3)
+                {
+                    Console.WriteLine($"[execute]   ⚠ cursor STILL at ({preCursor.X},{preCursor.Y}); skipping click to avoid hitting something unintended");
+                    continue;
+                }
+            }
             ClickAt(actual);
-            GetCursorPos(out var postCursor);
-            if (postCursor.X != actual.X || postCursor.Y != actual.Y)
-                Console.WriteLine($"[execute]   cursor landed at ({postCursor.X},{postCursor.Y}) — expected ({actual.X},{actual.Y}) — possible focus issue");
 
             // ── VERIFY ──────────────────────────────────────────────────────
             Console.WriteLine($"[verify] waiting up to {PostClickDelayMs}ms for state to advance...");

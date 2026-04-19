@@ -48,6 +48,48 @@ public sealed class LearnedPositions
         }
     }
 
+    /// <summary>
+    /// Infer this code's position from a learned SIBLING in the same layout.
+    /// Returns null if no sibling data or ambiguous.
+    ///
+    /// Uses the order in <paramref name="codeOrder"/> (AvailableResponseCodes) as the vertical
+    /// stacking order — index 0 is the top button. Assumes ~<paramref name="rowHeight"/>px
+    /// row spacing.
+    /// </summary>
+    public System.Drawing.Point? LookupBySibling(string layoutKey, int responseCode, int[] codeOrder, int rowHeight = 40)
+    {
+        int targetIdx = Array.IndexOf(codeOrder, responseCode);
+        if (targetIdx < 0) return null;
+
+        // Find the CLOSEST sibling with learned data.
+        lock (_sync)
+        {
+            System.Drawing.Point? best = null;
+            int bestDistance = int.MaxValue;
+            int bestSiblingIdx = -1;
+
+            for (int i = 0; i < codeOrder.Length; i++)
+            {
+                if (i == targetIdx) continue;
+                if (!_map.TryGetValue((layoutKey, codeOrder[i]), out var list) || list.Count == 0) continue;
+                int dist = Math.Abs(i - targetIdx);
+                if (dist < bestDistance)
+                {
+                    bestDistance = dist;
+                    bestSiblingIdx = i;
+                    var xs = list.Select(p => p.X).OrderBy(v => v).ToArray();
+                    var ys = list.Select(p => p.Y).OrderBy(v => v).ToArray();
+                    best = new System.Drawing.Point(xs[xs.Length / 2], ys[ys.Length / 2]);
+                }
+            }
+
+            if (best is null) return null;
+
+            int rowOffset = (targetIdx - bestSiblingIdx) * rowHeight;
+            return new System.Drawing.Point(best.Value.X, best.Value.Y + rowOffset);
+        }
+    }
+
     /// <summary>Returns count of observations per (layoutKey, responseCode) pair.</summary>
     public IReadOnlyDictionary<(string, int), int> CoverageCounts()
     {
