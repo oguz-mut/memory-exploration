@@ -413,6 +413,18 @@ public class ClickExecutor
         return cal;
     }
 
+    /// <summary>Given pre-state and the observed post-phase, infer which code was actually pressed.</summary>
+    static int? InferHitCode(GameState pre, GamePhase postPhase)
+    {
+        foreach (var candidateCode in pre.AvailableResponseCodes)
+        {
+            var expected = GameState.ExpectedNextPhase(pre, candidateCode);
+            if (expected.HasValue && expected.Value == postPhase)
+                return candidateCode;
+        }
+        return null;
+    }
+
     // ── Click execution ──────────────────────────────────────────────────────
     public async Task ClickResponseCodeAsync(int responseCode, GameState currentState, CancellationToken ct)
     {
@@ -477,22 +489,43 @@ public class ClickExecutor
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
 
-        // Offset scan — dialog can shift within a row (~40px tall buttons).
-        // Stay INSIDE the current button row first (±20 covers typical drift).
-        // Then try adjacent rows (±40, ±80...) — but validate post-phase so adjacent-button
-        // hits are rejected rather than silently recorded as correct.
-        var offsets = new List<(int dx, int dy)>
+        // Direction-aware offset scan. Row height ~40px, so ±40 hits adjacent buttons.
+        // We bias the scan AWAY from adjacent buttons, toward empty body/space, based on
+        // our target code's position in AvailableResponseCodes.
+        int idx = Array.IndexOf(currentState.AvailableResponseCodes, responseCode);
+        bool hasAbove = idx > 0;
+        bool hasBelow = idx >= 0 && idx < currentState.AvailableResponseCodes.Length - 1;
+
+        var offsets = new List<(int dx, int dy)> { (0, 0) };
+        // Always try small within-row drift first (safe — stays on correct button).
+        offsets.Add((0, -20)); offsets.Add((0, +20));
+
+        // Then bias toward the safe direction (no adjacent button that way).
+        if (!hasAbove && hasBelow)
         {
-            (0, 0),
-            (0, -20), (0, +20),          // within-row drift
-            (0, -40), (0, +40),          // adjacent row (risk wrong button — validator catches)
-            (0, -80), (0, +80),
-            (0, -120), (0, +120),
-            // X nudges with Y=0 (horizontal drift)
-            (-30, 0), (+30, 0),
-            (+30, -20), (-30, -20),
-            (+30, +20), (-30, +20),
-        };
+            // Safe to scan UP (nothing above). Dangerous to scan down (+40 = adjacent).
+            offsets.AddRange(new[] { (0, -40), (0, -80), (0, -120), (0, -160) });
+            // Only try below at big offsets that skip past the neighbor.
+            offsets.AddRange(new[] { (0, +80), (0, +120), (0, +160) });
+        }
+        else if (hasAbove && !hasBelow)
+        {
+            // Safe to scan DOWN. Dangerous up.
+            offsets.AddRange(new[] { (0, +40), (0, +80), (0, +120), (0, +160) });
+            offsets.AddRange(new[] { (0, -80), (0, -120), (0, -160) });
+        }
+        else if (!hasAbove && !hasBelow)
+        {
+            // Only button — scan freely both directions.
+            offsets.AddRange(new[] { (0, -40), (0, +40), (0, -80), (0, +80), (0, -120), (0, +120) });
+        }
+        else
+        {
+            // Sandwiched (has both neighbors) — avoid ±40 entirely; jump past adjacent rows.
+            offsets.AddRange(new[] { (0, -80), (0, +80), (0, -120), (0, +120), (0, -160), (0, +160) });
+        }
+        // X drift fallbacks at the end.
+        offsets.AddRange(new[] { (-30, 0), (+30, 0) });
 
         int maxAttempts = offsets.Count;  // exhaust the full scan before giving up
 
@@ -525,7 +558,18 @@ public class ClickExecutor
                     if (expected.HasValue && latest.Phase != expected.Value)
                     {
                         Console.WriteLine($"[verify] ⚠ WRONG BUTTON: clicked code={responseCode} expecting {expected} but got {latest.Phase}");
-                        Console.WriteLine($"[verify]   NOT recording ({actual.X},{actual.Y}) — click hit an adjacent button");
+                        // Infer which code we actually hit and record the position against IT.
+                        int? actualCode = InferHitCode(currentState, latest.Phase);
+                        if (actualCode.HasValue && LearnedPositions is not null)
+                        {
+                            LearnedPositions.Record(layoutKey, actualCode.Value, actual);
+                            LearnedPositions.Save();
+                            Console.WriteLine($"[verify]   silver lining: learned {layoutKey}/{actualCode.Value} @ ({actual.X},{actual.Y}) from mis-click");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[verify]   NOT recording ({actual.X},{actual.Y})");
+                        }
                         Console.WriteLine($"[verify]   stopping scan; next cycle will handle the new state");
                         ExecutorStatus = $"wrong-button {currentState.Phase}->{latest.Phase}";
                         return;
