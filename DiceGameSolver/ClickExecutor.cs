@@ -477,23 +477,30 @@ public class ClickExecutor
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
 
-        // Y-offset scan — stale calibration / body-length variation. Applied to ALL phases
-        // because the dialog can move between sessions. Result gets a denser scan.
-        var yOffsets = currentState.Phase == GamePhase.Result
-            ? new[] { 0, -40, +40, -80, +80, -120, +120 }
-            : new[] { 0, -40, +40, -80, +80 };
+        // Offset scan — dialog can shift between sessions. We scan Y (primary axis) then X.
+        // Each entry is a (dx, dy) offset from target. Dense scan covers ±160 Y and ±30 X.
+        var offsets = new List<(int dx, int dy)>
+        {
+            (0, 0),
+            (0, -40), (0, +40),
+            (0, -80), (0, +80),
+            (0, -120), (0, +120),
+            (0, -160), (0, +160),
+            // Final fallback: small X drift combined with Y offsets
+            (-30, 0), (+30, 0),
+            (-30, -40), (+30, -40),
+            (-30, +40), (+30, +40),
+        };
 
-        int maxAttempts = usingLearned
-            ? 3                 // trust learned Y mostly, but allow a couple of scans if wrong
-            : MaxRetries;
+        int maxAttempts = offsets.Count;  // exhaust the full scan before giving up
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            int dy = yOffsets[Math.Min(attempt - 1, yOffsets.Length - 1)];
-            var actual = new System.Drawing.Point(target.X, target.Y + dy);
-            string dyLabel = dy == 0 ? "center" : (dy > 0 ? $"+{dy}px" : $"{dy}px");
-            ExecutorStatus = $"attempt {attempt}/{maxAttempts} code={responseCode} dy={dy}";
-            Console.WriteLine($"[execute] 3/3: click attempt {attempt}/{maxAttempts} at ({actual.X},{actual.Y}) [{dyLabel}]");
+            var (dx, dy) = offsets[attempt - 1];
+            var actual = new System.Drawing.Point(target.X + dx, target.Y + dy);
+            string label = (dx == 0 && dy == 0) ? "center" : $"dx={dx:+#;-#;0} dy={dy:+#;-#;0}";
+            ExecutorStatus = $"attempt {attempt}/{maxAttempts} code={responseCode} {label}";
+            Console.WriteLine($"[execute] 3/3: click attempt {attempt}/{maxAttempts} at ({actual.X},{actual.Y}) [{label}]");
 
             ClickObserver.SetSuppressed();
             GetCursorPos(out var preCursor);
@@ -524,8 +531,8 @@ public class ClickExecutor
             Console.WriteLine($"[verify] ✗ no advance after {PostClickDelayMs}ms, still at {preSig}");
             if (attempt < maxAttempts)
             {
-                int nextDy = yOffsets[Math.Min(attempt, yOffsets.Length - 1)];
-                Console.WriteLine($"[retry] re-dismiss and try dy={nextDy}px");
+                var (ndx, ndy) = offsets[attempt];
+                Console.WriteLine($"[retry] re-dismiss and try dx={ndx:+#;-#;0} dy={ndy:+#;-#;0}");
                 ClickObserver.SetSuppressed();
                 ClickAt(Calibration.Dismiss);
                 await Task.Delay(DismissDelayMs, ct);
