@@ -47,6 +47,12 @@ public class ClickExecutor
     public int DismissDelayMs { get; set; } = 300;
     public int MaxRetries { get; set; } = 3;
 
+    /// <summary>Optional learned positions; consulted before calibration fallback.</summary>
+    public LearnedPositions? LearnedPositions { get; set; }
+
+    /// <summary>True if the most recent click used a learned position (vs calibrated).</summary>
+    public bool LastClickUsedLearned { get; private set; }
+
     /// <summary>Program.cs sets this to return the latest parsed state (for advance detection).</summary>
     public Func<Models.GameState?>? LatestStateProvider { get; set; }
 
@@ -417,7 +423,12 @@ public class ClickExecutor
             return;
         }
 
-        System.Drawing.Point? target = (currentState.Phase, responseCode) switch
+        // ── 1. Try learned position first ────────────────────────────────────
+        var layoutKey = LayoutKey.For(currentState);
+        var learned = LearnedPositions?.Lookup(layoutKey, responseCode);
+
+        // ── 2. Calibration fallback ───────────────────────────────────────────
+        System.Drawing.Point? calibratedTarget = (currentState.Phase, responseCode) switch
         {
             (GamePhase.Intro,   GameState.CodePlay)         => Calibration.IntroPlay,
             (GamePhase.Playing, GameState.CodeRaise)        => Calibration.PlayingRaise,
@@ -432,37 +443,52 @@ public class ClickExecutor
             _ => (System.Drawing.Point?)null
         };
 
-        if (target is null)
+        if (learned is null && calibratedTarget is null)
         {
             ExecutorStatus = $"WARNING: no mapping for phase={currentState.Phase} code={responseCode}";
             Console.WriteLine($"[clicker] {ExecutorStatus}");
             return;
         }
 
-        if (currentState.Phase == GamePhase.Playing && responseCode == GameState.CodeStandPat && Calibration.StandPatSkipped)
+        bool usingLearned = learned.HasValue;
+        LastClickUsedLearned = usingLearned;
+
+        if (usingLearned)
+            Console.WriteLine($"[clicker] using learned position for {layoutKey}/{responseCode} @ ({learned!.Value.X},{learned.Value.Y})");
+
+        if (currentState.Phase == GamePhase.Playing && responseCode == GameState.CodeStandPat && !usingLearned && Calibration.StandPatSkipped)
             Console.WriteLine("[clicker] WARNING: Stand Pat not calibrated — using Roll1 position (reduced EV)");
 
+        var target = (usingLearned ? learned : calibratedTarget)!.Value;
         var preSig = currentState.Signature;
-        Console.WriteLine($"[clicker] START phase={currentState.Phase} code={responseCode} dismiss=({Calibration.Dismiss.X},{Calibration.Dismiss.Y}) target=({target.Value.X},{target.Value.Y})");
+
+        Console.WriteLine($"[clicker] START phase={currentState.Phase} code={responseCode} learned={usingLearned} dismiss=({Calibration.Dismiss.X},{Calibration.Dismiss.Y}) target=({target.X},{target.Y})");
         Console.WriteLine($"[clicker] preSig: {preSig}");
 
         FocusGameWindow();
+        ClickObserver.SetSuppressed();
         Console.WriteLine($"[clicker] clicking dismiss ({Calibration.Dismiss.X},{Calibration.Dismiss.Y})");
         ClickAt(Calibration.Dismiss);
         await Task.Delay(DismissDelayMs, ct);
 
-        // Y-offset retry pattern: Result screens shift buttons by 0/1/2 dice-interaction lines.
-        // Pattern [0, -40, +40, -80, +80] explores rows around calibrated Y.
+        // Y-offset scan: Result screens shift buttons by variable rows.
+        // When using a learned position, we Y-scan from the learned Y (not calibrated Y).
+        // For non-Result phases with learned position, cap attempts at 1 (fast path).
         var yOffsets = currentState.Phase == GamePhase.Result
             ? new[] { 0, -40, +40, -80, +80 }
             : new[] { 0, 0, 0, 0, 0 };
 
-        for (int attempt = 1; attempt <= MaxRetries; attempt++)
+        int maxAttempts = usingLearned
+            ? (currentState.Phase == GamePhase.Result ? yOffsets.Length : 1)
+            : MaxRetries;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
             int dy = yOffsets[Math.Min(attempt - 1, yOffsets.Length - 1)];
-            var actual = new System.Drawing.Point(target.Value.X, target.Value.Y + dy);
-            ExecutorStatus = $"attempt {attempt}/{MaxRetries} phase={currentState.Phase} code={responseCode} dy={dy}";
-            Console.WriteLine($"[clicker] attempt {attempt}/{MaxRetries}: click target ({actual.X},{actual.Y}) dy={dy}");
+            var actual = new System.Drawing.Point(target.X, target.Y + dy);
+            ExecutorStatus = $"attempt {attempt}/{maxAttempts} phase={currentState.Phase} code={responseCode} dy={dy}";
+            Console.WriteLine($"[clicker] attempt {attempt}/{maxAttempts}: click target ({actual.X},{actual.Y}) dy={dy}");
+            ClickObserver.SetSuppressed();
             ClickAt(actual);
 
             // Poll for state advance (signature change) up to PostClickDelayMs
@@ -480,15 +506,16 @@ public class ClickExecutor
             }
 
             Console.WriteLine($"[clicker] attempt {attempt} no advance, state still {preSig}");
-            // On retry, also re-dismiss in case a dice overlay re-appeared
-            if (attempt < MaxRetries)
+            // On retry, re-dismiss in case a dice overlay re-appeared
+            if (attempt < maxAttempts)
             {
+                ClickObserver.SetSuppressed();
                 ClickAt(Calibration.Dismiss);
                 await Task.Delay(DismissDelayMs, ct);
             }
         }
 
-        Console.WriteLine($"[clicker] STUCK: {MaxRetries} attempts exhausted at {preSig}");
+        Console.WriteLine($"[clicker] STUCK: {maxAttempts} attempts exhausted at {preSig}");
         ExecutorStatus = $"STUCK at {preSig}";
     }
 }
