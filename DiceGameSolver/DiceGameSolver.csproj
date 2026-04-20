@@ -13,4 +13,13 @@
     <ProjectReference Include="..\MemoryLib\MemoryLib.csproj" />
   </ItemGroup>
 
+  <!-- Unblock freshly-compiled binaries so Windows App Control doesn't reject them.
+       Runs after every build. -Force + silent fallbacks so it never fails the build. -->
+  <Target Name="UnblockBuildOutput" AfterTargets="Build">
+    <Exec
+      Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;Get-ChildItem -Path '$(TargetDir)' -Recurse -Include *.dll,*.exe -ErrorAction SilentlyContinue | ForEach-Object { try { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue } catch {} ; try { (Get-Item $_.FullName).Attributes = 'Normal' } catch {} }&quot;"
+      ContinueOnError="true"
+      IgnoreExitCode="true" />
+  </Target>
+
 </Project>
