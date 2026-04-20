@@ -151,9 +151,9 @@ var correlationTask = Task.Run(async () =>
     (GameState State, DateTime ArrivedAt)? prev = null;
     var clickQ = new Queue<ClickEvent>();  // last 8 clicks
 
-    try
+    while (!cts.Token.IsCancellationRequested)
     {
-        while (!cts.Token.IsCancellationRequested)
+        try
         {
             // Drain observation channel into local queue
             while (observer.ObservationChannel.Reader.TryRead(out var click))
@@ -188,7 +188,8 @@ var correlationTask = Task.Run(async () =>
                                 learnedPositions.Record(layoutKey, code.Value, pt);
                                 int age = (int)(arrivedAt - match.TimestampUtc).TotalMilliseconds;
                                 Console.WriteLine($"[learn] {layoutKey} code={code.Value} @ ({pt.X},{pt.Y}) from click {age}ms before transition");
-                                learnedPositions.Save();
+                                try { learnedPositions.Save(); }
+                                catch (Exception ex) { Console.WriteLine($"[learn] save failed (will retry on next record): {ex.Message}"); }
                             }
                             else
                             {
@@ -203,9 +204,9 @@ var correlationTask = Task.Run(async () =>
 
             await Task.Delay(50, cts.Token);
         }
+        catch (OperationCanceledException) { break; }
+        catch (Exception ex) { Console.WriteLine($"[learn] correlation error (continuing): {ex.Message}"); await Task.Delay(200, cts.Token); }
     }
-    catch (OperationCanceledException) { }
-    catch (Exception ex) { Console.WriteLine($"[learn] correlation error: {ex.Message}"); }
 });
 
 // Periodic save every 60 s

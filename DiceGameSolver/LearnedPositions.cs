@@ -7,6 +7,7 @@ public sealed class LearnedPositions
 {
     private readonly Dictionary<(string layoutKey, int responseCode), List<System.Drawing.Point>> _map = new();
     private readonly object _sync = new();
+    private readonly object _saveLock = new();
 
     private static string FilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -106,7 +107,8 @@ public sealed class LearnedPositions
 
     // ── Persistence ──────────────────────────────────────────────────────────
 
-    /// <summary>Atomic write: temp file → rename, so partial writes never corrupt data.</summary>
+    /// <summary>Atomic write: temp file → rename, so partial writes never corrupt data.
+    /// Thread-safe under concurrent callers via a dedicated save lock.</summary>
     public void Save()
     {
         List<LearnedEntry> entries;
@@ -120,11 +122,24 @@ public sealed class LearnedPositions
             }).ToList();
         }
 
-        var path = FilePath;
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        var tmp = path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(entries, new JsonSerializerOptions { WriteIndented = true }));
-        File.Move(tmp, path, overwrite: true);
+        lock (_saveLock)
+        {
+            var path = FilePath;
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var tmp = path + ".tmp";
+            try
+            {
+                File.WriteAllText(tmp, JsonSerializer.Serialize(entries, new JsonSerializerOptions { WriteIndented = true }));
+                File.Move(tmp, path, overwrite: true);
+            }
+            catch (IOException)
+            {
+                // Retry once after brief pause; transient lock contention is common on Windows.
+                System.Threading.Thread.Sleep(50);
+                File.WriteAllText(tmp, JsonSerializer.Serialize(entries, new JsonSerializerOptions { WriteIndented = true }));
+                File.Move(tmp, path, overwrite: true);
+            }
+        }
     }
 
     /// <summary>Load from disk; returns empty store on missing file or schema drift.</summary>
